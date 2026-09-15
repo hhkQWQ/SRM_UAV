@@ -95,10 +95,8 @@ def angle_diff_deg(a, b):
     例如 10° 与 170° 实际相差的是20°
     因此不能直接 abs(a-b)。
     """
-    diff = abs(a - b)
     # 将差值限制到 0~180
-    while diff > 180:
-        diff -= 180
+    diff = abs(a - b) % 180.0
     # 方向具有 180° 对称性
     if diff > 90:
         diff = 180 - diff
@@ -152,8 +150,8 @@ def detect_lights(img):
         [RED_THRESHOLD, BLUE_THRESHOLD],     # 颜色阈值列表
         x_stride=1,                          # 全分辨率扫描x轴步长
         y_stride=1,                          # 全分辨率扫描y轴步长
-        area_threshold=5,                    # 面积阈值，只保留外接矩形面积大于等于右侧数值像素的色块
-        pixels_threshold=5,                  # 像素数阈值，只保留实际包含像素数量大于等于5的色块
+        area_threshold=MIN_PIXELS,           # 面积阈值，只保留外接矩形面积大于等于该值的色块
+        pixels_threshold=MIN_PIXELS,         # 像素数阈值，只保留实际包含像素数量大于等于该值的色块
         merge=False                          # 表示合并相邻色块，false表示否
     )
     red_lights = []
@@ -206,26 +204,30 @@ def detect_lights(img):
         )
 
         # ====================================================
+        # 灯条公共属性只构造一次
+        # color 字段由红蓝分支分别补充
+        # ====================================================
+        light = {
+            "blob": blob,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+            "cx": cx,
+            "cy": cy,
+            "pixels": blob.pixels(),
+            "elongation": blob.elongation(),
+            "angle": angle,
+            "length": length
+        }
+
+        # ====================================================
         # 红色 threshold
         # 第 0 个 threshold -> bit 0 -> 0x01
         # ====================================================
         if code & 0x01:
-            red_light = {
-                "blob": blob,
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
-                "cx": cx,
-                "cy": cy,
-                "pixels": blob.pixels(),
-                "elongation": blob.elongation(),
-                "angle": angle,
-                "length": length,
-                "color": "RED"
-            }
             red_lights.append(
-                red_light
+                dict(light, color="RED")
             )
 
             if DEBUG_DRAW_LIGHTS:
@@ -246,23 +248,8 @@ def detect_lights(img):
         # 第 1 个 threshold -> bit 1 -> 0x02
         # ====================================================
         if code & 0x02:
-            blue_light = {
-                "blob": blob,
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
-                "cx": cx,
-                "cy": cy,
-                "pixels": blob.pixels(),
-                "elongation": blob.elongation(),
-                "angle": angle,
-                "length": length,
-                "color": "BLUE"
-            }
-
             blue_lights.append(
-                blue_light
+                dict(light, color="BLUE")
             )
 
             if DEBUG_DRAW_LIGHTS:
@@ -323,12 +310,7 @@ def calc_pair_score(light1, light2, detail=False):
     # ========================================================
     # 3. 两灯条长度一致性
     # ========================================================
-    if len1 > len2:
-        max_len = len1
-    else:
-        max_len = len2
-    if max_len <= 0:
-        return None
+    max_len = max(len1, len2)
     length_diff_ratio = (
         abs(len1 - len2) / max_len
     )
@@ -410,38 +392,26 @@ def calc_pair_score(light1, light2, detail=False):
     # 12. 角度评分
     # ========================================================
 
-    angle_score = (1.0 - angle_diff / 30.0)
-
-    if angle_score < 0.0:
-        angle_score = 0.0
+    angle_score = max(0.0, 1.0 - angle_diff / 30.0)
 
     # ========================================================
     # 13. 平行错位评分
     # ========================================================
 
-    offset_score = (1.0 - parallel_ratio)
-
-    if offset_score < 0.0:
-        offset_score = 0.0
+    offset_score = max(0.0, 1.0 - parallel_ratio)
 
     # ========================================================
     # 14. 长度一致性评分
     # ========================================================
 
-    length_score = (1.0 - length_diff_ratio / 0.70)
-
-    if length_score < 0.0:
-        length_score = 0.0
+    length_score = max(0.0, 1.0 - length_diff_ratio / 0.70)
 
     # ========================================================
     # 15. 灯条间距评分
     # ========================================================
 
     distance_error = abs(normal_ratio - IDEAL_NORMAL_RATIO)
-    distance_score = (1.0 - distance_error / IDEAL_NORMAL_RATIO)
-
-    if distance_score < 0.0:
-        distance_score = 0.0
+    distance_score = max(0.0, 1.0 - distance_error / IDEAL_NORMAL_RATIO)
 
     # ========================================================
     # 16. 根据距离动态调整评分权重
@@ -528,7 +498,7 @@ def calc_pair_score(light1, light2, detail=False):
 
 def find_best_pair(lights):
     """
-    对所有候选灯条进行两两组合。x
+    对所有候选灯条进行两两组合。
     第一阶段：
         calc_pair_score() 只返回 float score，
         不创建详细 dict。
@@ -599,17 +569,10 @@ def find_best_pair(lights):
                 best_b = b
 
     # ========================================================
-    # 没有合法组合
+    # 没有合法组合，或低于最低评分限制
     # ========================================================
 
-    if best_a is None:
-        return None
-
-    # ========================================================
-    # 最低评分限制
-    # ========================================================
-
-    if best_score < MIN_PAIR_SCORE:
+    if best_a is None or best_score < MIN_PAIR_SCORE:
         return None
 
     # ========================================================
