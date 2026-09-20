@@ -4,6 +4,7 @@
 import sensor
 import time
 import math
+from armor_tracker import MotionTracker
 # ============================================================
 # 2. 参数配置区
 #    所有需要调节的参数
@@ -23,7 +24,7 @@ DEBUG_PRINT = False
 # OpenMV IDE阈值编辑器格式：(L_min, L_max, A_min, A_max, B_min, B_max)
 # 大致理解为：L：亮度  A：负值偏绿，正值偏红  B：负值偏蓝，正值偏黄
 RED_THRESHOLD = (40, 100, 20, 127, 20, 127)
-BLUE_THRESHOLD = (36, 100, -60, 80, -128, 15)
+BLUE_THRESHOLD = (36, 100, -60, 80, -128, 0)
 
 # ---------- 灯条粗筛参数 ----------
 # 远距离灯条像素很少，所以这里必须放宽
@@ -38,13 +39,13 @@ MIN_ELONGATION = 0.30
 # 两灯条最大允许角度差
 MAX_ANGLE_DIFF_DEG = 35.0
 # 两灯条最大长度差比例
-MAX_LENGTH_DIFF_RATIO = 0.75
+MAX_LENGTH_DIFF_RATIO = 0.50
 # 两灯条沿灯条方向最大错位
 MAX_PARALLEL_RATIO = 1.50
 # 两灯条法线方向最小间距
-MIN_NORMAL_RATIO = 0.40
+MIN_NORMAL_RATIO = 1.0
 # 两灯条法线方向最大间距
-MAX_NORMAL_RATIO = 5.50
+MAX_NORMAL_RATIO = 3.0
 
 # ---------- 几何评分参数 ----------
 # 理想情况下：
@@ -53,7 +54,7 @@ MAX_NORMAL_RATIO = 5.50
 IDEAL_NORMAL_RATIO = 2.4
 # 最低装甲板几何得分
 # 低于这个值即使是所有组合中的最高分也不输出
-MIN_PAIR_SCORE = 0.45
+MIN_PAIR_SCORE = 0.55
 
 # ============================================================
 # 3. 摄像头初始化
@@ -152,7 +153,8 @@ def detect_lights(img):
         y_stride=1,                          # 全分辨率扫描y轴步长
         area_threshold=MIN_PIXELS,           # 面积阈值，只保留外接矩形面积大于等于该值的色块
         pixels_threshold=MIN_PIXELS,         # 像素数阈值，只保留实际包含像素数量大于等于该值的色块
-        merge=False                          # 表示合并相邻色块，false表示否
+        merge=True,                           # 表示合并相邻色块，false表示否
+        margin=2
     )
     red_lights = []
     blue_lights = []
@@ -359,18 +361,39 @@ def calc_pair_score(light1, light2, detail=False):
     # ========================================================
     # 9. 法线方向距离
     # ========================================================
-
     normal_distance = abs(
         -dx * uy +
         dy * ux
     )
+
+    # 两根灯条的近似厚度
+    thickness1 = min(
+        light1["w"],
+        light1["h"]
+    )
+
+    thickness2 = min(
+        light2["w"],
+        light2["h"]
+    )
+
+    # 中心距减去两边各半个灯条厚度
+    # 得到真正的“灯条之间空隙”
+    normal_gap = (
+        normal_distance
+        - 0.5 * thickness1
+        - 0.5 * thickness2
+    )
+
+    if normal_gap < 0:
+        normal_gap = 0
 
     # ========================================================
     # 10. 归一化
     # ========================================================
 
     parallel_ratio = (parallel_offset * inv_avg_len)
-    normal_ratio = (normal_distance * inv_avg_len)
+    normal_ratio = (normal_gap * inv_avg_len)
 
     # ========================================================
     # 11. 硬约束
@@ -489,7 +512,7 @@ def calc_pair_score(light1, light2, detail=False):
             distance_score
     }
 # ============================================================
-# 7. M2：寻找最佳灯条配对
+# 7. 寻找最佳灯条配对
 # ============================================================
 
 
@@ -688,6 +711,44 @@ SERIAL_PRINT_INTERVAL = 5000  # 5000ms = 5秒
 # ------------------------------------------------------------
 last_armor_color = None
 
+# ============================================================
+# 连续帧 / 运动预测跟踪器
+# ============================================================
+
+tracker = MotionTracker(
+
+    # 新目标连续 3 帧才正式锁定
+    confirm_frames=3,
+
+    # 已锁定目标最多允许连续 4 帧没有正常匹配
+    max_lost_frames=4,
+
+    # 初次捕获阶段
+    acquire_base_gate=35.0,
+    acquire_size_factor=1.20,
+    acquire_speed_factor=0.80,
+    acquire_max_gate=110.0,
+
+    # 正式跟踪阶段
+    track_base_gate=10.0,
+    track_size_factor=0.60,
+    track_speed_factor=0.90,
+    track_max_gate=100.0,
+
+    # Alpha-Beta 滤波器
+    track_alpha=0.70,
+    track_beta=0.20,
+
+    # 候选速度平滑
+    pending_velocity_alpha=0.60,
+
+    # 丢失时速度衰减
+    lost_velocity_decay=0.92,
+
+    # 单次预测最大 dt
+    track_max_dt_ms=150
+)
+
 
 while True:
 
@@ -748,35 +809,99 @@ while True:
         best_pair = blue_pair
         armor_color = "BLUE"
     # ========================================================
-    # 6. 找到合法装甲板
+    # 6. 将单帧识别结果送入“连续帧 + 运动预测”跟踪器
     # ========================================================
+    now_track = time.ticks_ms()
+
     if best_pair is not None:
 
+        # 当前帧原始识别位置
         cx, cy, x, y, w, h = get_pair_geometry(
             best_pair
         )
-        if armor_color != last_armor_color:
+
+        # 用装甲候选的图像尺寸作为动态门限参考。
+        # 近距离装甲更大，允许的像素位移也相应增大。
+        target_size = max(
+            w,
+            h
+        )
+
+        (
+            stable_valid_now,
+            stable_color_now,
+            stable_cx_now,
+            stable_cy_now
+        ) = tracker.update(
+            True,
+            now_track,
+            armor_color,
+            cx,
+            cy,
+            target_size
+        )
+
+    else:
+
+        (
+            stable_valid_now,
+            stable_color_now,
+            stable_cx_now,
+            stable_cy_now
+        ) = tracker.update(
+            False,
+            now_track
+        )
+
+    # ========================================================
+    # 7. 只使用经过连续帧确认 / 运动跟踪后的结果
+    # ========================================================
+
+    if stable_valid_now:
+        # 防止短暂预测把输出坐标带出 QVGA 图像范围
+        stable_cx_now = max(
+            0,
+            min(
+                img.width() - 1,
+                stable_cx_now
+            )
+        )
+
+        stable_cy_now = max(
+            0,
+            min(
+                img.height() - 1,
+                stable_cy_now
+            )
+        )
+        # 颜色变化时才打印
+        if stable_color_now != last_armor_color:
             print(
                 "COLOR=%s"
-                % armor_color
+                % stable_color_now
             )
-            last_armor_color = armor_color
+            last_armor_color = stable_color_now
+
+        # 最终绿色十字只画稳定后的目标中心
         if DEBUG_DRAW_PAIR:
+
             img.draw_cross(
-                cx,
-                cy,
+                stable_cx_now,
+                stable_cy_now,
                 size=8,
                 color=(0, 255, 0),
                 thickness=2
             )
-    # ========================================================
-    # 7. 当前没有找到合法装甲板
-    # ========================================================
+
     else:
+
+        # 连续丢失达到阈值以后才输出 NONE
         if last_armor_color is not None:
+
             print(
                 "COLOR=NONE"
             )
+
             last_armor_color = None
     # ========================================================
     # 8. 串口周期输出
