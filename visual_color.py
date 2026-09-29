@@ -23,12 +23,12 @@ DEBUG_PRINT = False
 # 使用 OpenMV IDE 的阈值编辑器调整
 # OpenMV IDE阈值编辑器格式：(L_min, L_max, A_min, A_max, B_min, B_max)
 # 大致理解为：L：亮度  A：负值偏绿，正值偏红  B：负值偏蓝，正值偏黄
-RED_THRESHOLD = (40, 100, 20, 127, 20, 127)
+RED_THRESHOLD = (10, 100, 20, 127, -30, 127)
 BLUE_THRESHOLD = (36, 100, -60, 80, -128, 0)
 
 # ---------- 灯条粗筛参数 ----------
 # 远距离灯条像素很少，所以这里必须放宽
-MIN_PIXELS = 5
+MIN_PIXELS = 3
 # 灯条长边至少几个像素
 MIN_LIGHT_LEN = 3
 # 只用于排除特别明显的块状区域
@@ -74,7 +74,7 @@ sensor.set_auto_whitebal(False)
 # 创建 FPS 计时器
 clock = time.clock()
 # 关闭自动曝光并设置曝光时间
-sensor.set_auto_exposure(False, exposure_us=2000)
+sensor.set_auto_exposure(False, exposure_us=2500)
 
 
 # ============================================================
