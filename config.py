@@ -24,7 +24,7 @@ DEBUG_DRAW_PAIR = True
 DEBUG_PRINT = False
 
 # True：把即将发送的 MAVLink 帧以十六进制打印到 IDE 串口
-DEBUG_PRINT_HEX_FRAME = False
+DEBUG_PRINT_HEX_FRAME = True
 
 # 调试打印间隔（ms）
 DEBUG_PRINT_INTERVAL_MS = 5000

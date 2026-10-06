@@ -181,3 +181,42 @@ md文件编写前面的计划表
 # 9/29
 1.上完北航的无人机基础培训课：【北航RM无人机培训-哔哩哔哩】 https://b23.tv/SjeaVNP
 
+# 10/4开发
+# 待办事项
+## 联调（近期）
+- [ ] 核对 OpenMV Pro Plus UART 引脚（`config.UART_PORT`）
+- [ ] 7 个 `.py` 拷到板子，跑 `main.py`
+- [ ] PC 用 `tools/mavlink_decode.py` 联调验证
+- [ ] 已知距离反标定 `REAL_LIGHT_SPACING_MM`
+- [ ] yaw/pitch 符号约定与飞控方核对
+## 后续（等实体飞控）
+- [ ] 飞控接口 + 联调
+- [ ] （可选）自定义 MAVLink 消息承载 color/state/score
+- [ ] （可选）PnP 测距 / IMU 融合 / 相机-机体外参
+- [ ] 联调通过后删除 `visual_color.py`
+
+# 开发记录
+## 完成：MAVLink 通信 + 坐标解算输出
+### 方案
+- 通信：MAVLink v2 + 标准消息 `LANDING_TARGET(#149)`，UART 115200
+- 解算：像素→视线角（内参）+ 相似三角形测距 + 单点去畸变 + 状态机
+- 结构：库化重构，`main.py` 只做编排
+
+### 新建文件（10 个）
+- `main.py` / `config.py` / `camera_params.py`（标定独立成文件）
+- `armor_detect.py`（拆分自 `visual_color.py`）
+- `coordinate_solver.py`（角度/距离/状态/角速度）
+- `mavlink.py`（CRC + 组帧 + LANDING_TARGET）
+- `comm.py`（UART 层）
+- `tools/mavlink_decode.py`（PC 解码工具）
+- `tools/test_mavlink_pack.py` / `test_coordinate_solver.py`（测试）
+
+### 验证
+- mavlink 与 pymavlink 逐字节对拍通过
+- 解算器 40 项单测通过
+- comm 假 UART 冒烟通过（0 CRC 错误）
+
+### 关键决策
+- 消息用标准 `LANDING_TARGET`，颜色/状态编码进 `target_num`
+- 单点去畸变默认开启（消除边缘 0.3° 偏差）
+- 装甲板尺寸先参数化，待实测标定
