@@ -3,22 +3,12 @@
 # UART 通信层：把解算结果打包成 MAVLink 帧并发送
 #
 # 这是项目中唯一接触串口硬件的文件。
-# 可以向 ArmorComm 注入一个带 write() 方法的对象替代真实 UART，
-# 以便在 PC 上做测试。
 # ============================================================
 
 import time
 
 import config
 from mavlink import MAVLinkV2
-
-
-# MicroPython 有 time.ticks_diff，CPython 没有；两边都能跑
-def _ticks_diff(now, old):
-    try:
-        return time.ticks_diff(now, old)
-    except AttributeError:
-        return now - old
 
 
 def _open_uart():
@@ -36,11 +26,8 @@ def _open_uart():
 
 class ArmorComm:
 
-    def __init__(self, uart=None):
-        if uart is None:
-            uart = _open_uart()
-
-        self.uart = uart
+    def __init__(self):
+        self.uart = _open_uart()
 
         self.mav = MAVLinkV2(
             config.MAV_SYSTEM_ID,
@@ -82,7 +69,7 @@ class ArmorComm:
         if (
             config.SEND_INTERVAL_MS > 0 and
             self.last_send_ms is not None and
-            _ticks_diff(now_ms, self.last_send_ms) < config.SEND_INTERVAL_MS
+            time.ticks_diff(now_ms, self.last_send_ms) < config.SEND_INTERVAL_MS
         ):
             return False
 
@@ -114,7 +101,7 @@ class ArmorComm:
         """
         if config.SEND_HEARTBEAT and (
             self.last_heartbeat_ms is None or
-            _ticks_diff(now_ms, self.last_heartbeat_ms) >= config.HEARTBEAT_INTERVAL_MS
+            time.ticks_diff(now_ms, self.last_heartbeat_ms) >= config.HEARTBEAT_INTERVAL_MS
         ):
             self.send_heartbeat(now_ms)
 

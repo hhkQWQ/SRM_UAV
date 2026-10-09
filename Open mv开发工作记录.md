@@ -184,9 +184,10 @@ md文件编写前面的计划表
 # 10/4开发
 # 待办事项
 ## 联调（近期）
-- [ ] 核对 OpenMV Pro Plus UART 引脚（`config.UART_PORT`）
-- [ ] 7 个 `.py` 拷到板子，跑 `main.py`
-- [ ] PC 用 `tools/mavlink_decode.py` 联调验证
+- [√] 核对 OpenMV Pro Plus UART 引脚（`config.UART_PORT`）
+- [√] 7 个 `.py` 拷到板子，跑 `main.py`
+- [√] PC 用 `tools/mavlink_decode.py` 联调验证：
+      代码：python tools/mavlink_decode.py --port COM8 --baud 115200
 - [ ] 已知距离反标定 `REAL_LIGHT_SPACING_MM`
 - [ ] yaw/pitch 符号约定与飞控方核对
 ## 后续（等实体飞控）
@@ -220,3 +221,54 @@ md文件编写前面的计划表
 - 消息用标准 `LANDING_TARGET`，颜色/状态编码进 `target_num`
 - 单点去畸变默认开启（消除边缘 0.3° 偏差）
 - 装甲板尺寸先参数化，待实测标定
+
+# 10/6开发
+1.成功在终端输出我想要的数据 使用mavlink协议的通讯链路测试成功 电脑端口是COM8
+
+同济25 武科自瞄和导航
+
+可能需要做装甲板中心的图案识别 目标：敌方基地 / 前哨站
+
+导航这块有点想参考成熟RM自瞄的内容
+今天先阅读华南师范大学的开源
+华南师范大学：https://github.com/FaterYU/rm_auto_aim/
+
+思考修改点：1.不应该用best_pair选出最优目标 detector给出多个评分超过阈值的目标并且进入detector selection 加入图案/数字识别之后通过这个选项select我想攻击的目标 2.装甲板识别可以优化灯条的识别，是否使用fitline？以及红蓝判断使用阈值判断器还是RGB的sum_r>sum_b（参考硬件环境）？灯条本身的集合过滤和fill ratio？ 3.IMU gyro补偿图像运动or坐标转换到惯性系
+
+# 10/8开发
+参考同济 / 华南师范 / 武科自瞄开源的装甲板识别部分，改进 armor_detect.py
+同济大学：https://github.com/TongjiSuperPower/sp_vision_25
+武汉科技大学：https://github.com/WUST-RM/awakening
+PnP是否需要添加？
+
+## 1. 装甲板去重（参考同济）
+- 流程改为：候选生成 -> 去重 -> 最高分胜出
+- 同侧共用灯条保包围框面积小；交叉共用灯条保几何评分高
+- 修复同济链式淘汰缺陷（三灯条两两合法时不会全灭）；候选按 cx 确定性排序，防止逐帧抖动
+- 局限：4 灯条贪心仍可能留下中间伪对，根治靠后续多目标输出 + 图案识别
+
+## 2. 灰度提取 + 独立判色 + 形状筛选（参考华南师范 / 武科）
+- 提取：find_blobs 只限 L 通道 (LIGHT_L_MIN,100,...) 等价灰度二值化；LIGHT_EXTRACT_MODE="LAB" 保留旧方式做对照
+- 判色：blob 外框外扩 COLOR_ROI_PAD，get_statistics 统计 L >= COLOR_SAMPLE_L_MIN 的色晕，红蓝均值差 > COLOR_DIFF_MIN 才判色，否则视为白光丢弃
+- 形状：宽长比 MIN/MAX_LIGHT_RATIO（旋转长短轴）+ 填充率 MIN_FILL_RATIO（blob.solidity()），像素 < SHAPE_CHECK_MIN_PIXELS 时跳过
+- 不移植单灯条倾角约束：无人机视角下装甲板可能整体倾斜
+
+## 3. 代码清理 + 调试精简
+- 调试开关 8 个 -> 3 个：DEBUG_MODE（0 比赛 / 1 跟踪 / 2 调参）、DEBUG_PRINT_INTERVAL_MS、DEBUG_PRINT_HEX_FRAME
+- 模式 1：绿十字 + 状态变化实时打印 + 周期报告（FPS、状态帧数、检测漏斗每帧平均、TARGET、HINT 自动诊断瓶颈）
+- 模式 2：再画红 / 蓝框（通过的灯条）+ 黄线（去重后候选对），打印 SCORE（最佳对各项得分）和 BLOB（每个亮斑的 ratio / fill / diff / 剔除原因）
+- 删除无用代码：light 字典未用字段、solver 中 pixel_to_angles / decode_target_num / range、tracker.reset、PC 测试兜底代码及 tools/test_*.py
+
+## 4. 配对评分改造
+- 现象：提高 LIGHT_L_MIN 后蓝色明显改善；红灯条被切短（3.4m 处仅 4.5px），错位 / 灯长 = 0.89，offset 项几乎扣光，远距离时总分靠权重 0.55 的角度项支撑，角度噪声一大就跌破门槛
+- 核对三家源码：华南师范 / 同济 / 武科都不做加权评分，几何只用硬阈值，最终交给分类器
+- 错位改为倾斜角 tilt = atan(错位 / 法向间距)，上限 MAX_TILT_DEG=25（同济 uav.yaml），删除 MAX_PARALLEL_RATIO
+- 各项得分统一为 1 - 实测 / 上限；权重 PAIR_WEIGHTS=(0.35, 0.25, 0.25, 0.15)（tilt / 间距 / 长度 / 角度差），灯长 < 8px 时去掉角度项；MIN_PAIR_SCORE 0.55 -> 0.40
+- HINT：有对帧 50%~90% 时追加"最可能："的瓶颈项
+
+## 待上机标定（DEBUG_MODE=2）
+- [ ] 红灯条被切短：降 LIGHT_L_MIN 到 15~20，同时 SHAPE_CHECK_MIN_PIXELS 提到 25~30 保住蓝色
+- [ ] 调 EXPOSURE_US 和 LIGHT_L_MIN：灯条核心刚好饱和、背景尽量黑
+- [ ] 看 BLOB 行真灯条的 fill / diff 分布，定 MIN_FILL_RATIO（目标约 0.8）和 COLOR_DIFF_MIN；放白光 / 反光物确认被剔除
+- [ ] 过曝场景对比 LAB 与 GRAY 的灯条完整度、判色正确率和帧率
+- [ ] 单 / 双装甲板 / 反光干扰下看黄线分布

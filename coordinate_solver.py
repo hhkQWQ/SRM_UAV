@@ -9,8 +9,6 @@
 #   yaw_error   > 0 ：目标在光轴右侧
 #   pitch_error > 0 ：目标在光轴下方（图像 y 轴向下）
 #   机体坐标 FRD    ：x 前（沿光轴） y 右  z 下
-#
-# 本模块可以直接在 PC 的 CPython 下 import 做单元测试。
 # ============================================================
 
 import math
@@ -34,14 +32,12 @@ COLOR_NONE = 0
 COLOR_RED = 1
 COLOR_BLUE = 2
 
-COLOR_NAMES = ("NONE", "RED", "BLUE")
-
 
 # ============================================================
 # 2. 像素 -> 归一化坐标（含单点去畸变）
 # ============================================================
 
-def undistort_point(u, v, iterations=None):
+def undistort_point(u, v):
     """
     对单个像素点做去畸变，返回归一化相机坐标 (x, y)。
 
@@ -50,9 +46,6 @@ def undistort_point(u, v, iterations=None):
     每次迭代用当前估计的 (x, y) 计算畸变量，再从观测值中扣除。
     10 次迭代即可收敛到远小于 1e-6 的精度。
     """
-    if iterations is None:
-        iterations = config.UNDISTORT_ITERATIONS
-
     k1, k2, p1, p2, k3 = cam.DIST_COEFFS
 
     xd = (u - cam.CX) / cam.FX
@@ -61,7 +54,7 @@ def undistort_point(u, v, iterations=None):
     x = xd
     y = yd
 
-    for _ in range(iterations):
+    for _ in range(config.UNDISTORT_ITERATIONS):
         r2 = x * x + y * y
         r4 = r2 * r2
 
@@ -76,34 +69,20 @@ def undistort_point(u, v, iterations=None):
     return x, y
 
 
-def pixel_to_normalized(u, v, undistort=None):
+def pixel_to_normalized(u, v):
     """
     像素坐标 -> 归一化相机坐标 (x, y)。
         x = (u - cx) / fx
         y = (v - cy) / fy
-    undistort=True 时先去畸变。
+    config.UNDISTORT=True 时先去畸变。
     """
-    if undistort is None:
-        undistort = config.UNDISTORT
-
-    if undistort:
+    if config.UNDISTORT:
         return undistort_point(u, v)
 
     return (
         (u - cam.CX) / cam.FX,
         (v - cam.CY) / cam.FY,
     )
-
-
-def pixel_to_angles(u, v, undistort=None):
-    """
-    像素坐标 -> 视线角 (yaw_error, pitch_error)，单位 rad。
-        yaw_error   = atan(x)
-        pitch_error = atan(y)
-    两个轴独立取反正切，与 PX4 对 LANDING_TARGET.angle_x/angle_y 的解释一致。
-    """
-    x, y = pixel_to_normalized(u, v, undistort)
-    return math.atan(x), math.atan(y)
 
 
 def radial_scale(u, v, x_n, y_n):
@@ -127,19 +106,16 @@ def radial_scale(u, v, x_n, y_n):
 # 3. 距离 / 尺寸 / 速度 / 坐标
 # ============================================================
 
-def estimate_distance(spacing_px, light_len_px, method=None):
+def estimate_distance(spacing_px, light_len_px):
     """
     相似三角形估计深度 Z（沿光轴，单位 m）：
         l = f * L / Z   =>   Z = f * L / l
-    method:
+    config.DISTANCE_METHOD:
         "SPACING"：L = 灯条中心距，l = spacing_px（默认）
         "LENGTH" ：L = 灯条长度，  l = light_len_px
     输入不合法时返回 0.0。
     """
-    if method is None:
-        method = config.DISTANCE_METHOD
-
-    if method == "LENGTH":
+    if config.DISTANCE_METHOD == "LENGTH":
         if light_len_px <= 0:
             return 0.0
         return cam.FY * (config.REAL_LIGHT_LEN_MM * 0.001) / light_len_px
@@ -224,11 +200,6 @@ def encode_target_num(state, color):
     return ((state & 0x03) << 2) | (color & 0x03)
 
 
-def decode_target_num(target_num):
-    """ 返回 (state, color) """
-    return (target_num >> 2) & 0x03, target_num & 0x03
-
-
 # ============================================================
 # 5. 带状态的解算器
 # ============================================================
@@ -267,7 +238,6 @@ class TargetSolver:
             "pitch_error": 0.0,
 
             "distance": 0.0,     # 深度 Z（沿光轴）
-            "range": 0.0,        # 欧氏距离
 
             "size_x": 0.0,
             "size_y": 0.0,
@@ -313,6 +283,7 @@ class TargetSolver:
         out["cy"] = cy
 
         # ---------- 角度 ----------
+        # 两轴独立取反正切，与 PX4 对 LANDING_TARGET.angle_x/angle_y 的解释一致
         x_n, y_n = pixel_to_normalized(cx, cy)
 
         yaw = math.atan(x_n)
@@ -349,7 +320,6 @@ class TargetSolver:
         depth = self.distance if self.has_distance else 0.0
 
         out["distance"] = depth
-        out["range"] = depth * math.sqrt(1.0 + x_n * x_n + y_n * y_n)
 
         # ---------- 角尺寸 ----------
         size_x, size_y = estimate_angular_size(

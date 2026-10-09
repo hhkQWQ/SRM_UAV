@@ -108,27 +108,6 @@ class MotionTracker:
     # 对外接口
     # ============================================================
 
-    def reset(self):
-        """
-        完全重置跟踪器。
-        """
-        self.stable_valid = False
-        self.stable_color = None
-
-        self.stable_cx = 0.0
-        self.stable_cy = 0.0
-
-        self.stable_vx = 0.0
-        self.stable_vy = 0.0
-
-        self.stable_size = 0.0
-        self.stable_time = time.ticks_ms()
-
-        self.lost_count = 0
-
-        self._reset_pending()
-
-
     def get_velocity(self):
         """
         返回当前稳定目标的图像速度：
