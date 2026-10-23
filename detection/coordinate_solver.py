@@ -6,9 +6,10 @@
 # 输出：视线角、距离、角尺寸、机体坐标、状态机编码
 #
 # 坐标 / 符号约定（联调时必须与飞控核对，否则会反向打舵）：
-#   yaw_error   > 0 ：目标在光轴右侧
-#   pitch_error > 0 ：目标在光轴下方（图像 y 轴向下）
-#   机体坐标 FRD    ：x 前（沿光轴） y 右  z 下
+#   image_angle_x > 0：目标在画面右；image_angle_y > 0：目标在画面下
+#   yaw_error/pitch_error保留为旧字段别名，不再解释为机体yaw/pitch误差。
+#   机体FRD：x前 y右 z下；下视光轴沿机体下轴，画面上方对应机头。
+#   相机位置未填时XYZ仅为“以相机为原点、按机体轴表达”的近似向量。
 # ============================================================
 
 import math
@@ -150,14 +151,18 @@ def los_rates(vx_px_ms, vy_px_ms, x_n=0.0, y_n=0.0):
 
 def body_coords(depth, yaw, pitch):
     """
-    深度 + 视线角 -> 机体 FRD 坐标 (x, y, z)，单位 m。
-        x = Z（前）  y = Z * tan(yaw)（右）  z = Z * tan(pitch)（下）
+    光轴深度+两个图像视线角 -> 机体轴表达的目标坐标，单位m。
+    参数yaw/pitch为兼容旧调用保留，实际指image_angle_x/image_angle_y。
+    下视默认：x=-depth*tan(image_angle_y), y=depth*tan(image_angle_x), z=depth。
+    若CAMERA_POS_B_M已填，再把原点由相机光心平移到机体参考点。
     """
-    return (
-        depth,
-        depth * math.tan(yaw),
-        depth * math.tan(pitch),
-    )
+    point_c = (depth * math.tan(yaw), depth * math.tan(pitch), depth)
+    rotation = config.CAMERA_ROTATION_BC
+    result = tuple(sum(rotation[i][j] * point_c[j] for j in range(3)) for i in range(3))
+    offset = config.CAMERA_POS_B_M
+    if offset is not None:
+        result = tuple(result[i] + offset[i] for i in range(3))
+    return result
 
 
 # ============================================================
@@ -236,8 +241,12 @@ class TargetSolver:
 
             "yaw_error": 0.0,
             "pitch_error": 0.0,
+            "image_angle_x": 0.0,
+            "image_angle_y": 0.0,
 
             "distance": 0.0,     # 深度 Z（沿光轴）
+            "slant_distance": 0.0,  # 相机光心到目标的距离，供MAVLink使用
+            "body_position_valid": False,
 
             "size_x": 0.0,
             "size_y": 0.0,
@@ -283,7 +292,7 @@ class TargetSolver:
         out["cy"] = cy
 
         # ---------- 角度 ----------
-        # 两轴独立取反正切，与 PX4 对 LANDING_TARGET.angle_x/angle_y 的解释一致
+        # 两个图像视线角；下视安装时不是机体yaw/pitch姿态误差。
         x_n, y_n = pixel_to_normalized(cx, cy)
 
         yaw = math.atan(x_n)
@@ -291,6 +300,8 @@ class TargetSolver:
 
         out["yaw_error"] = yaw
         out["pitch_error"] = pitch
+        out["image_angle_x"] = yaw
+        out["image_angle_y"] = pitch
 
         # ---------- 尺寸采信 + 距离低通 ----------
         if (
@@ -320,6 +331,7 @@ class TargetSolver:
         depth = self.distance if self.has_distance else 0.0
 
         out["distance"] = depth
+        out["slant_distance"] = depth * math.sqrt(1.0 + x_n*x_n + y_n*y_n)
 
         # ---------- 角尺寸 ----------
         size_x, size_y = estimate_angular_size(
@@ -334,6 +346,10 @@ class TargetSolver:
         out["x"] = bx
         out["y"] = by
         out["z"] = bz
+        out["body_position_valid"] = (
+            depth > 0 and config.CAMERA_POS_B_M is not None
+            and config.CAMERA_ORIENTATION_CONFIRMED
+        )
 
         # ---------- 视线角速度 ----------
         yaw_rate, pitch_rate = los_rates(vx_px_ms, vy_px_ms, x_n, y_n)

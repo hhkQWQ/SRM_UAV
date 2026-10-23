@@ -192,8 +192,9 @@ def print_report(fps, frames, pair_frames, state_frames, out, best_pair,
     if out["valid"]:
         print(
             "TARGET state=%s color=%s px=(%d,%d) "
-            "yaw=%.2fdeg pitch=%.2fdeg dist=%.2fm "
-            "size=(%.2f,%.2f)deg rate=(%.2f,%.2f)deg/s" % (
+            "img_ax=%.2fdeg img_ay=%.2fdeg depth=%.2fm "
+            "size=(%.2f,%.2f)deg rate=(%.2f,%.2f)deg/s "
+            "xyz_B=(%.2f,%.2f,%.2f)m origin=%s" % (
                 STATE_NAMES[out["state"]],
                 out["color"],
                 out["cx"],
@@ -205,6 +206,8 @@ def print_report(fps, frames, pair_frames, state_frames, out, best_pair,
                 out["size_y"] * RAD2DEG,
                 out["yaw_rate"] * RAD2DEG,
                 out["pitch_rate"] * RAD2DEG,
+                out["x"], out["y"], out["z"],
+                "BODY" if out["body_position_valid"] else "CAMERA_APPROX",
             )
         )
 

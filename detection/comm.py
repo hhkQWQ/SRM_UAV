@@ -77,16 +77,17 @@ class ArmorComm:
             time_usec=now_ms * 1000,
             target_num=out["target_num"],
             frame=config.LANDING_TARGET_FRAME,
-            angle_x=out["yaw_error"],
-            angle_y=out["pitch_error"],
-            distance=out["distance"],
+            angle_x=out["image_angle_x"],
+            angle_y=out["image_angle_y"],
+            distance=out["slant_distance"],
             size_x=out["size_x"],
             size_y=out["size_y"],
             x=out["x"],
             y=out["y"],
             z=out["z"],
             msg_type=config.LANDING_TARGET_TYPE,
-            position_valid=1 if out["valid"] else 0,
+            position_valid=1 if (out["valid"] and out["body_position_valid"]
+                                 and config.LANDING_TARGET_POSITION_VALID) else 0,
             trim=config.TRIM_PAYLOAD,
         )
 

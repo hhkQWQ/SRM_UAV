@@ -214,7 +214,7 @@ SEND_INTERVAL_MS = 0
 #       target_num 携带 LOST 状态），让下位机知道目标消失。
 # 注意：标准 PX4 精准降落会把任何 LANDING_TARGET 当作有效检测，
 #       接 PX4 原生功能时应改为 False。
-SEND_WHEN_LOST = True
+SEND_WHEN_LOST = False
 
 # True：周期性发送 HEARTBEAT，方便 QGC / Mission Planner 自动识别
 SEND_HEARTBEAT = True
@@ -224,8 +224,13 @@ HEARTBEAT_INTERVAL_MS = 1000
 TRIM_PAYLOAD = False
 
 # LANDING_TARGET.frame：MAV_FRAME_BODY_FRD = 12
-# 与坐标解算输出的 x 前 / y 右 / z 下 一致
+# XYZ以机体前/右/下表达；相机下视安装外参见下面第11节。
 LANDING_TARGET_FRAME = 12
+
+# PX4 1.17原生LANDING_TARGET仅支持LOCAL_NED有效绝对位置，
+# 这里没有无人机NED位置/姿态输入，故默认走angle_x/angle_y角度通道。
+# 仅自定义接收器明确支持BODY_FRD时才可改True。
+LANDING_TARGET_POSITION_VALID = False
 
 # LANDING_TARGET.type：LANDING_TARGET_TYPE_VISION_OTHER = 3
 LANDING_TARGET_TYPE = 3
@@ -237,3 +242,17 @@ LANDING_TARGET_TYPE = 3
 
 # 关闭自动曝光后的固定曝光时间（us）
 EXPOSURE_US = 2500
+
+
+# ============================================================
+# 11. 相机下视安装：画面上=机头，画面右=机体右
+# ============================================================
+# 光学C=(画面右,画面下,光轴前)，机体B=(前,右,下)。v_B=R_BC*v_C。
+# 因而x_B=-Y_C, y_B=X_C, z_B=Z_C。绕光轴装反/转90度时必须改此矩阵。
+CAMERA_ROTATION_BC = (
+    (0.0, -1.0, 0.0),
+    (1.0, 0.0, 0.0),
+    (0.0, 0.0, 1.0),
+)
+CAMERA_ORIENTATION_CONFIRMED = False
+CAMERA_POS_B_M = None  # 待填：机体参考点→相机光心(前,右,下)，单位m
