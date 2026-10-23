@@ -1,0 +1,3 @@
+__pycache__/
+native/_build/
+native/*.o

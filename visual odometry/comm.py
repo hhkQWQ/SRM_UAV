@@ -11,6 +11,42 @@ CRC_EXTRA = {0: 50, 31: 246, 76: 152, 77: 143,
              111: 34, 132: 85, 241: 90, 331: 91}
 
 
+class History:
+    """Fixed-capacity chronological ring; append never shifts the array."""
+    def __init__(self, capacity=None):
+        self.capacity = C.SENSOR_HISTORY_SIZE if capacity is None else capacity
+        if self.capacity < 2:
+            raise ValueError("history capacity must be at least two")
+        self.data = [None]*self.capacity
+        self.start = self.count = 0
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += self.count
+        if not 0 <= index < self.count:
+            raise IndexError(index)
+        return self.data[(self.start+index) % self.capacity]
+
+    def __iter__(self):
+        for i in range(self.count):
+            yield self[i]
+
+    def __reversed__(self):
+        for i in range(self.count-1, -1, -1):
+            yield self[i]
+
+    def append(self, item):
+        if self.count < self.capacity:
+            self.data[(self.start+self.count) % self.capacity] = item
+            self.count += 1
+        else:
+            self.data[self.start] = item
+            self.start = (self.start+1) % self.capacity
+
+
 class Clock:
     """将MicroPython ticks回绕展开；PC使用monotonic_ns。"""
     def __init__(self):
@@ -146,8 +182,8 @@ class FlightLink:
         self.parser = Parser()
         self.target = None
         self.sequence = 0
-        self.attitudes = []         # (飞控us, q_wxyz, gyro_b, 本地接收us)
-        self.ranges = []            # (飞控us, m, min, max, quality, variance, receive_us)
+        self.attitudes = History()  # (飞控us, q_wxyz, gyro_b, 本地接收us)
+        self.ranges = History()     # (飞控us, m, min, max, quality, variance, receive_us)
         self.vibration = None       # (本地us, 三项PX4指标, clipping0/1/2)
         self.boot_generation = 0
         self.time_generation = 0
@@ -176,6 +212,7 @@ class FlightLink:
         self.desired_streams = []
         self.request_after_us = 0
         self.next_stream_check_us = 0
+        self.last_odometry_stamp = -1
 
     def connected(self, now=None):
         now = self.clock.now_us() if now is None else now
@@ -238,22 +275,23 @@ class FlightLink:
         # 已开始的帧必须发完，不能截断字节流；其时间戳仍是原始采集时刻。
 
     def send_odometry(self, state):
+        if state["timestamp_us"] <= self.last_odometry_stamp:
+            return
+        self.last_odometry_stamp = state["timestamp_us"]
         self._queue(331, odometry_payload(state), True, state["timestamp_us"])
 
     def _history(self, target, item):
         if target and item[0] <= target[-1][0]:
             return
         target.append(item)
-        if len(target) > C.SENSOR_HISTORY_SIZE:
-            del target[0]
 
     def _restart(self):
         self.boot_generation += 1
         self.offset_us = None
         self.sync_count = 0
         self.pending_sync = None
-        self.attitudes = []
-        self.ranges = []
+        self.attitudes = History()
+        self.ranges = History()
         self.vibration = None
         self.range_candidates = set()
         self.range_id = None
@@ -263,8 +301,8 @@ class FlightLink:
         self._make_requests()
 
     def _make_requests(self):
-        attitude_hz = C.ATTITUDE_HZ if C.ATTITUDE_HZ is not None else min(100, max(30, 1.5*C.TARGET_FPS))
-        range_hz = C.RANGE_HZ if C.RANGE_HZ is not None else min(50, max(10, C.TARGET_FPS))
+        attitude_hz = C.ATTITUDE_HZ
+        range_hz = C.RANGE_HZ
         self.desired_streams = [(31, int(1000000/attitude_hz)),
                                 (132, int(1000000/range_hz))]
         if C.REQUEST_VIBRATION:
@@ -324,7 +362,7 @@ class FlightLink:
                 self.range_candidates.add(sid)
                 self.range_ambiguous = len(self.range_candidates) > 1
                 if self.range_ambiguous:
-                    self.ranges = []
+                    self.ranges = History()
                     return
                 self.range_id = sid
             quality = p[38] if len(payload) >= 39 else 0
@@ -349,8 +387,8 @@ class FlightLink:
                         if self.offset_us is not None:
                             self.time_generation += 1
                         self.offset_us, self.sync_count = sample, 1
-                        self.attitudes = []
-                        self.ranges = []
+                        self.attitudes = History()
+                        self.ranges = History()
                     elif abs(sample-self.offset_us) <= C.SYNC_MAX_JITTER_US:
                         self.offset_us += 0.2*(sample-self.offset_us)
                         self.sync_count += 1
@@ -378,7 +416,10 @@ class FlightLink:
         if pending is None or pending[0] == self.serviced_sync_token:
             return
         self.serviced_sync_token = pending[0]
-        deadline = pending[1]+C.SYNC_MAX_RTT_US
+        # Initial sync must cover the full round trip; otherwise a slow camera
+        # can postpone every reply until after the RTT gate and never initialize.
+        budget = C.SYNC_SERVICE_US if self.synced() else C.SYNC_MAX_RTT_US
+        deadline = min(pending[1]+C.SYNC_MAX_RTT_US, self.clock.now_us()+budget)
         while self.pending_sync is not None and self.clock.now_us() < deadline:
             self.poll()  # 不递归进入_service_sync
             if self.pending_sync is None:

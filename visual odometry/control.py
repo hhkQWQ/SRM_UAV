@@ -5,6 +5,7 @@
 import math
 import config as C
 import algorithm as A
+from comm import History
 
 
 def attitude_at(history, stamp):
@@ -62,7 +63,7 @@ def range_invalid_detail(distance, low, high, quality):
 
 class HeightTracker:
     def __init__(self):
-        self.samples = []  # (fc_us, body_height, sigma_m)
+        self.samples = History()  # (fc_us, body_height, sigma_m)
         self.last_stamp = -1
         self.valid = False
         self.good = 0
@@ -108,7 +109,8 @@ class HeightTracker:
             self.last_stamp = stamp
             r = A.q_matrix(attitude[0])
             down = A.rotate(r, C.TOF_AXIS_B)[2]
-            if down < math.cos(C.MAX_TILT_DEG*math.pi/180):
+            if (down <= C.MIN_RAY_DOWN or (C.MAX_TILT_DEG is not None
+                    and down < math.cos(C.MAX_TILT_DEG*math.pi/180))):
                 self.reject("RANGE_TILT")
                 continue
             height = distance*down+A.rotate(r, tof_pos)[2]
@@ -122,8 +124,6 @@ class HeightTracker:
                     self.reject("RANGE_JUMP")
                     continue
             self.samples.append((stamp, height, sigma))
-            if len(self.samples) > C.SENSOR_HISTORY_SIZE:
-                del self.samples[0]
             self.good += 1
             self.valid = self.good >= C.HEIGHT_RECOVERY_SAMPLES
             self.reason = "OK" if self.valid else "RANGE_RECOVERING"
@@ -151,7 +151,7 @@ class HeightTracker:
             return None
         velocity = 0.0
         if len(self.samples) >= 2:
-            a, b = self.samples[-2:]
+            a, b = self.samples[-2], self.samples[-1]
             dt = (b[0]-a[0])*1e-6
             if dt > 0:
                 velocity = max(-C.MAX_VERTICAL_SPEED_M_S,
@@ -164,9 +164,6 @@ class VOController:
     def __init__(self, engine=None):
         self.engine = engine if engine is not None else A.FeatureEngine()
         self.height = HeightTracker()
-        self.reference = None
-        self.reference_position = (0.0, 0.0)
-        self.reference_variance = (0.0, 0.0)
         self.reset_counter = 0
         self.keyframe_id = 0
         self.good_frames = 0
@@ -175,19 +172,15 @@ class VOController:
         self.previous_attitude = None
         self.previous_clipping = None
         self.clipping_until = 0
-        self.initial_failures = 0
-        self.has_tracked = False
+        self.lost_since = None
 
     def reset(self):
-        self.reference = None
-        self.reference_position = (0.0, 0.0)
-        self.reference_variance = (0.0, 0.0)
+        self.engine.reset()
         self.good_frames = 0
         self.previous_attitude = None
         self.reset_counter = (self.reset_counter+1) & 255
-        self.keyframe_id += 1
-        self.initial_failures = 0
-        self.has_tracked = False
+        self.keyframe_id = 0  # IDs are local to the reset_counter epoch.
+        self.lost_since = None
 
     def _result(self, stamp, reason, q=None, height=None, approximate=False):
         result = {"timestamp_us": stamp, "position": None, "q": q,
@@ -259,7 +252,8 @@ class VOController:
                 self.height = HeightTracker()
                 return result
         self.previous_attitude = (fc_stamp, q, gyro)
-        if r[8] < math.cos(C.MAX_TILT_DEG*math.pi/180) or speed > C.MAX_GYRO_RAD_S:
+        if ((C.MAX_TILT_DEG is not None and r[8] < math.cos(C.MAX_TILT_DEG*math.pi/180))
+                or (C.MAX_GYRO_RAD_S is not None and speed > C.MAX_GYRO_RAD_S)):
             self.good_frames = 0
             result["reason"] = "DYNAMIC_LIMIT"
             result["height"] = None
@@ -276,87 +270,70 @@ class VOController:
                 result["reason"] = "VIBRATION"
                 result["height"] = None
                 return result
-        if statistics is None:
+        if C.MIN_IMAGE_STDEV is not None and statistics is None:
             probe = getattr(self.engine, "probe", None)
             if probe is not None:
                 stats_start = A._us()
             statistics = image.get_statistics()
             if probe is not None:
                 probe.record("image_stats", A._elapsed(stats_start))
-        if statistics.stdev() < C.MIN_IMAGE_STDEV:
+        if C.MIN_IMAGE_STDEV is not None and statistics.stdev() < C.MIN_IMAGE_STDEV:
             self.good_frames = 0
             result["reason"] = "LOW_TEXTURE"
             return result
-        if hasattr(self.engine, "reference_height"):
-            self.engine.reference_height = self.reference.height if self.reference is not None else hc
-        frame = self.engine.extract(image, q, hc, camera_pos, stamp)
-        # FeatureEngine每次extract新建诊断字典；本帧估计直接补充同一对象。
+        motion = self.engine.process(image, q, hc, camera_pos, stamp)
         result["vision"] = getattr(self.engine, "diagnostics", {})
-        if frame is None:
+        result["matches"] = motion["matches"]
+        result["inliers"] = motion["inliers"]
+        result["keyframe"] = self.keyframe_id = motion["keyframe"]
+        if motion["status"] == 1:
             self.good_frames = 0
-            why = result["vision"].get("vision_reason", "NO_FEATURES")
-            result["reason"] = why if why in ("FEATURES_1D", "FEATURES_CLUSTERED") else "NO_FEATURES"
-            return result
-        if self.reference is None:
-            self.reference = frame
-            self.good_frames = 0
+            self.lost_since = None
             result["reason"] = "INITIALIZING"
             return result
-        motion = self.engine.estimate(self.reference, frame)
-        result["matches"] = result["vision"].get("matches", 0)
-        result["inliers"] = result["vision"].get("inliers", 0)
-        if motion is None:
+        if motion["status"] != 2:
             self.good_frames = 0
-            result["reason"] = "LOST"
-            self.initial_failures += 1
-            if not self.has_tracked and self.initial_failures >= 3:
-                # 尚未建立有效输出时可明确重建原点；建立轨迹后不把新图像
-                # 无依据地绑定到最后位置，仍等待旧关键帧重定位。
+            result["reason"] = "NO_FEATURES" if motion["status"] == -1 else "LOST"
+            if self.lost_since is None:
+                self.lost_since = stamp
+            elif stamp-self.lost_since >= C.LOST_RESET_US:
+                # Unknown displacement is never attached to the last position.
+                # A new zero origin is explicit and visible in reset_counter.
                 self.reset()
-                self.reference = frame
                 result.update(reason="REINITIALIZING", reset_counter=self.reset_counter,
                               keyframe=self.keyframe_id)
             return result
-        self.initial_failures = 0
+        self.lost_since = None
         delta = motion["delta"]
-        position = (self.reference_position[0]+delta[0], self.reference_position[1]+delta[1])
-        count = len(motion["inliers"])
+        position = motion["position"]
+        count = motion["inliers"]
         # 公共姿态/测距误差不按内点数量消掉。
         distance = math.sqrt(delta[0]**2+delta[1]**2)
         rotation_sigma = C.ATTITUDE_STD_RAD+speed*(attitude_age+C.SYNC_MAX_JITTER_US)*1e-6
-        sigma_common2 = ((max(hc, self.reference.height)*rotation_sigma)**2
-                         +(max(hc, self.reference.height)*getattr(self.engine, "pixel_sigma", C.PIXEL_STD)/min(C.FX, C.FY))**2
+        reference_height = motion["reference_height"]
+        sigma_common2 = ((max(hc, reference_height)*rotation_sigma)**2
+                         +(max(hc, reference_height)*getattr(self.engine, "pixel_sigma", C.PIXEL_STD)/min(C.FX, C.FY))**2
                          +(distance*height_sample[1]/max(hc, 0.1))**2
                          +C.POSITION_NOISE_FLOOR_M**2)
-        variance = tuple(self.reference_variance[i]+sigma_common2
+        variance = tuple(motion["base_variance"][i]+sigma_common2
                          +motion["sample_variance"][i]/count for i in range(2))
         freshness = max(0.1, 1.0-0.5*height_sample[2]/C.MAX_RANGE_AGE_US)
-        dynamic = max(0.15, 1.0-0.5*speed/C.MAX_GYRO_RAD_S)
         geometric = min(1.0, count/30.0)*motion["ratio"]
         geometric *= max(0.1, 1.0-0.5*motion["residual_px"]/C.RANSAC_THRESHOLD_PX)
-        quality = max(1, min(100, int(100*geometric*freshness*dynamic)))
+        geometric *= min(1.0, motion["cells"]/6.0)*min(1.0, motion["spread"]/.1)
+        quality = max(1, min(100, int(100*geometric*freshness)))
         if approximate:
             quality = min(quality, C.APPROXIMATE_QUALITY_CAP)
             variance = tuple(v+0.1**2 for v in variance)
+        self.engine.accept_variance(motion, variance)
         self.good_frames += 1
         result.update(position=position, variance=variance, matches=motion["matches"],
                       inliers=count, residual_px=motion["residual_px"], quality=quality,
                       reason="TRACKING", attitude_age_us=attitude_age,
-                      range_age_us=height_sample[2])
+                      range_age_us=height_sample[2], residual_yaw=motion["residual_yaw"])
         if self.good_frames < C.POSE_RECOVERY_FRAMES:
             result.update(position=None, quality=0, reason="POSE_RECOVERING")
             return result
         result["valid"] = True
-        self.has_tracked = True
         result["body_valid"] = not approximate
-        refresh = (distance > C.KEYFRAME_DISTANCE_HEIGHT_RATIO*min(hc, self.reference.height)
-                   or max(hc/self.reference.height, self.reference.height/hc) > C.KEYFRAME_HEIGHT_RATIO
-                   or A.q_angle(q, self.reference.q) > C.KEYFRAME_ROTATION_RAD
-                   or motion["ratio"] < C.KEYFRAME_REFRESH_INLIER_RATIO)
-        if refresh:
-            self.reference = frame
-            self.reference_position = position
-            self.reference_variance = variance
-            self.keyframe_id += 1  # 普通换关键帧不增加reset_counter
-        result["keyframe"] = self.keyframe_id
         return result

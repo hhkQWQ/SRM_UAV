@@ -5,7 +5,7 @@ from algorithm import euler_degrees
 
 _STATES = {
     "TRACKING": "跟踪正常", "INITIALIZING": "建立参考图",
-    "REINITIALIZING": "重建初始参考图", "POSE_RECOVERING": "确认跟踪稳定",
+    "REINITIALIZING": "轨迹重置，下帧重建原点", "POSE_RECOVERING": "确认跟踪稳定",
     "WAIT_HEARTBEAT": "等待飞控连接", "TIME_UNSYNCED": "等待时钟同步",
     "WAIT_ATTITUDE": "等待图像时刻的姿态", "EXTRINSICS_PENDING": "等待安装参数",
     "WAIT_RANGE": "等待测距", "WAIT_RANGE_ATTITUDE": "等待测距时刻的姿态",

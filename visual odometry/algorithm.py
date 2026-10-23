@@ -1,6 +1,6 @@
-"""算法计算：四元数、稀疏去畸变、平地投影、二维平移RANSAC、ORB。
+"""算法接口：姿态辅助函数与原生QVGA视觉核心。
 
-只在FeatureEngine中调用OpenMV的image；其余函数可在PC直接验证。
+正常跟踪传递紧凑缓冲；ORB只在关键帧建立与恢复时调用。
 """
 import math
 import time
@@ -109,285 +109,170 @@ def undistort(u, v):
     return x, y
 
 
-class GroundFrame:
-    """保存描述子和关键帧投影；不保存被绘图污染的相机framebuffer。"""
-    def __init__(self, descriptor, q, height, camera_pos, stamp, pixels=None,
-                 pixel_transform=(1.0, 1.0, 0.0, 0.0), lazy=False):
-        self.descriptor = descriptor
-        self.q = q
-        self.height = height
-        self.stamp = stamp
-        r_nb = q_matrix(q)
-        self.r_nc = matmul(r_nb, C.R_BC)
-        self.arm = rotate(r_nb, camera_pos)
-        count = len(pixels) if pixels is not None else len(descriptor)
-        sx, sy, ox, oy = pixel_transform
-        self.pixels = []
-        for i in range(count):
-            u, v = pixels[i] if pixels is not None else descriptor[i][:2]
-            self.pixels.append((u*sx+ox, v*sy+oy))
-        self.points = [None]*count
-        self.projected = [False]*count
-        if not lazy:
-            for i in range(count):
-                self.point(i)
-
-    def point(self, index):
-        if not self.projected[index]:
-            u, v = self.pixels[index]
-            xn, yn = undistort(u, v)
-            ray = rotate(self.r_nc, (xn, yn, 1.0))
-            if ray[2] > C.MIN_RAY_DOWN:
-                self.points[index] = (u, v, self.arm[0]+self.height*ray[0]/ray[2],
-                                      self.arm[1]+self.height*ray[1]/ray[2], xn, yn)
-            self.projected[index] = True
-        return self.points[index]
-
-    def spread(self):
-        n = len(self.pixels)
-        if n < 2:
-            return 0, 0.0
-        cells = set()
-        x = y = xx = yy = xy = 0.0
-        for u, v in self.pixels:
-            cells.add((min(2, int(u*3/C.IMAGE_WIDTH)), min(2, int(v*3/C.IMAGE_HEIGHT))))
-            x += u
-            y += v
-            xx += u*u
-            yy += v*v
-            xy += u*v
-        xx, yy, xy = max(0.0, xx-x*x/n), max(0.0, yy-y*y/n), xy-x*y/n
-        trace = xx+yy
-        root = math.sqrt(max(0.0, (xx-yy)**2+4*xy*xy))
-        return len(cells), max(0.0, trace-root)/max(1e-9, trace+root)
-
-
-def _rows(reference, current, pairs):
-    """为每对点预计算相机坐标，RANSAC内环不再求旋转或去畸变。"""
-    rows = []
-    for i, j in pairs:
-        if i < 0 or j < 0 or i >= len(reference.points) or j >= len(current.points):
-            continue
-        a, b = reference.point(i), current.point(j)
-        if a is None or b is None:
-            continue
-        base = inverse_rotate(current.r_nc,
-                              (a[2]-current.arm[0], a[3]-current.arm[1], current.height))
-        # dx,dy, baseX/Y/Z, observed normalized x/y, current raw u/v, source indices
-        rows.append((a[2]-b[2], a[3]-b[3], base[0], base[1], base[2],
-                     b[4], b[5], b[0], b[1], i, j))
-    return rows
-
-
-def _residual2(row, dx, dy, r):
-    # R_nc^T * (ground_NE - body_delta_NE - arm_NE, camera_height)
-    x = row[2]-r[0]*dx-r[3]*dy
-    y = row[3]-r[1]*dx-r[4]*dy
-    z = row[4]-r[2]*dx-r[5]*dy
-    if z <= 1e-5:
-        return 1e30
-    ex, ey = C.FX*(x/z-row[5]), C.FY*(y/z-row[6])
-    return ex*ex+ey*ey
-
-
-def ransac_translation(reference, current, pairs, seed=1, diagnostics=None, probe=None):
-    """已知姿态/高度的平面平移模型。返回None或几何估计dict。
-
-    单个点对能提出2DoF假设；必须由足够多、空间分散的内点验证。
-    对内点加权精化；公共姿态/高度误差由control额外计入方差。
-    """
-    if probe is not None:
-        start = _us()
-    rows = _rows(reference, current, pairs)
-    n = len(rows)
-    if diagnostics is not None:
-        diagnostics.update(matches=n, inliers=0, vision_reason="MATCH_COUNT")
-    if probe is not None:
-        probe.record("project", _elapsed(start))
-    if n < C.MIN_MATCHES:
-        return None
-    if probe is None:
-        return _fit_translation(rows, current, seed, diagnostics)
-    start = _us()
-    try:
-        return _fit_translation(rows, current, seed, diagnostics)
-    finally:
-        probe.record("fit", _elapsed(start))
-
-
-def _fit_translation(rows, current, seed, diagnostics):
-    n = len(rows)
-    r, gate2 = current.r_nc, C.RANSAC_THRESHOLD_PX**2
-    best_count, best_cost, best = 0, 1e30, None
-    limit, iteration = min(n, C.RANSAC_MAX_ITERATIONS), 0
-    seen = set()
-    while iteration < limit:
-        seed = (1664525*seed+1013904223) & 0xFFFFFFFF
-        idx = seed % n
-        while idx in seen:
-            idx = (idx+1) % n
-        seen.add(idx)
-        dx, dy = rows[idx][:2]
-        count, cost = 0, 0.0
-        for row in rows:
-            error = _residual2(row, dx, dy, r)
-            if error <= gate2:
-                count += 1
-                cost += error
-        if count > best_count or (count == best_count and cost < best_cost):
-            best_count, best_cost, best = count, cost, (dx, dy)
-            ratio = count/n
-            if ratio >= 1.0:
-                need = C.RANSAC_MIN_ITERATIONS
-            elif ratio > 0:
-                need = int(math.ceil(math.log(1-C.RANSAC_CONFIDENCE)/math.log(1-ratio)))
-            else:
-                need = limit
-            limit = min(limit, max(C.RANSAC_MIN_ITERATIONS, need))
-        iteration += 1
-    if best is None:
-        return None
-    dx, dy = best
-    for _ in range(2):
-        sx, sy, sw = 0.0, 0.0, 0.0
-        for row in rows:
-            error = _residual2(row, dx, dy, r)
-            if error <= gate2:
-                weight = 1.0/max(1.0, math.sqrt(error))
-                sx += weight*row[0]
-                sy += weight*row[1]
-                sw += weight
-        if sw == 0:
-            return None
-        dx, dy = sx/sw, sy/sw
-    inliers, cells, errors, vx, vy = [], set(), 0.0, 0.0, 0.0
-    for row in rows:
-        error = _residual2(row, dx, dy, r)
-        if error <= gate2:
-            inliers.append((row[9], row[10]))
-            cells.add((min(2, int(row[7]*3/C.IMAGE_WIDTH)),
-                       min(2, int(row[8]*3/C.IMAGE_HEIGHT))))
-            errors += error
-            vx += (row[0]-dx)**2
-            vy += (row[1]-dy)**2
-    count = len(inliers)
-    if (count < C.MIN_INLIERS or count/n < C.MIN_INLIER_RATIO
-            or len(cells) < C.MIN_OCCUPIED_CELLS):
-        if diagnostics is not None:
-            diagnostics.update(inliers=count, cells=len(cells),
-                vision_reason=("INLIERS" if count < C.MIN_INLIERS else
-                               "INLIER_RATIO" if count/n < C.MIN_INLIER_RATIO else "COVERAGE"))
-        return None
-    if diagnostics is not None:
-        diagnostics.update(inliers=count, cells=len(cells), vision_reason="OK")
-    return {"delta": (dx, dy), "inliers": inliers, "matches": n,
-            "ratio": count/n, "cells": len(cells), "iterations": iteration,
-            "residual_px": math.sqrt(errors/count),
-            "sample_variance": (vx/max(1, count-1), vy/max(1, count-1))}
-
-
 class FeatureEngine:
-    """固件原生AGAST/ORB；没有在MicroPython中逐像素扫描。"""
+    """Native QVGA frontend; Python schedules sensors and ORB recovery."""
     def __init__(self, probe=None):
+        from array import array
+        try:
+            import rm_vo
+        except ImportError:
+            raise RuntimeError("缺少rm_vo原生模块：请按README编译并安装固件")
+        if rm_vo.ABI_VERSION != 1:
+            raise RuntimeError("rm_vo接口版本不匹配，请更新固件和全部Python文件")
         import image
-        self.image_module = image
-        self.sequence = 0
-        self.work = None
-        self.threshold = C.KEYPOINT_THRESHOLD
-        self.limit = C.MAX_KEYPOINTS
-        self.diagnostics = {}
+        self.image_module, self.array = image, array
+        self.core = rm_vo.Core(native_settings())
+        self.meta = array('f', [0.0]*13)
+        self.timestamp = array('I', [0, 0])
+        self.prediction = array('f', [0.0]*3)
+        self.raw = array('f', [0.0]*23)
+        self.probe, self.service = probe, None
         self.pixel_sigma = C.PIXEL_STD
-        self.service = None
-        self.probe = probe
-        self.detector = "FAST" if C.FEATURE_DETECTOR == "auto" else C.FEATURE_DETECTOR
+        self.reset()
+
+    def reset(self):
+        self.core.reset()
+        self.key_descriptor = None
+        self.last_position = self.last_stamp = None
+        self.velocity = (0.0, 0.0)
+        self.velocity_stamp = None
+        self.key_variance = self.previous_variance = (0.0, 0.0)
         self.empty_frames = 0
-        self.reference_height = None
+        self.diagnostics = {}
+
+    def _record(self, name, start):
+        if self.probe is not None:
+            self.probe.record(name, _elapsed(start))
 
     def _service(self):
         if self.service is not None:
-            if self.probe is None:
-                self.service()
-            else:
-                start = _us()
-                self.service()
-                self.probe.record("vision_poll", _elapsed(start))
-
-    def extract(self, image, q, height, camera_pos, stamp):
-        if image.width() != C.IMAGE_WIDTH or image.height() != C.IMAGE_HEIGHT:
-            raise ValueError("image resolution differs from calibration")
-        start = _us()
-        scale = C.FEATURE_SCALE
-        if scale == 1.0:
-            work = image
-        elif self.work is None:
-            self.work = image.copy(x_scale=scale, y_scale=scale, hint=self.image_module.AREA)
-            work = self.work
-        else:
-            self.work.draw_image(image, 0, 0, x_scale=scale, y_scale=scale, hint=self.image_module.AREA)
-            work = self.work
-        if self.probe is not None:
-            self.probe.record("resize", _elapsed(start))
-        used_threshold, used_limit = self.threshold, self.limit
-        detector_name = self.detector
-        detector = (self.image_module.CORNER_FAST if detector_name == "FAST"
-                    else self.image_module.CORNER_AGAST)
-        if detector_name == "FAST":
-            used_threshold = min(90, used_threshold*3)
-        normalized = C.KEYPOINT_NORMALIZED
-        if self.reference_height is not None and abs(math.log(height/self.reference_height)) > .12:
-            normalized = False
-        if self.probe is not None:
-            detect_start = _us()
-        descriptor = work.find_keypoints(threshold=used_threshold,
-            normalized=normalized, scale_factor=C.KEYPOINT_SCALE_FACTOR,
-            max_keypoints=used_limit,
-            corner_detector=detector)
-        elapsed = _elapsed(start)
-        if self.probe is not None:
-            self.probe.record("features", _elapsed(detect_start))
-        count = 0 if descriptor is None else len(descriptor)
-        self.diagnostics = dict(keypoints=count, detector=used_threshold, detector_name=detector_name,
-            normalized=normalized, limit=used_limit,
-            matches=0, inliers=0, vision_reason="NO_FEATURES", work_size=(work.width(), work.height()))
-        self._service()
-        if C.FEATURE_ADAPTIVE:
-            self.empty_frames = self.empty_frames+1 if count < C.MIN_MATCHES else 0
-            if C.FEATURE_DETECTOR == "auto" and self.empty_frames >= 3:
-                self.detector = "AGAST"
-            if count < max(C.MIN_MATCHES+4, used_limit//2):
-                self.threshold = max(5, self.threshold-2)
-            elif count >= int(used_limit*.9):
-                self.threshold = min(40, self.threshold+1)
-            budget = 1000000/max(1, C.TARGET_FPS)*.4
-            if elapsed > budget and count >= C.MIN_MATCHES+4:
-                floor = min(C.MAX_KEYPOINTS, max(24, C.MIN_MATCHES+4))
-                self.limit = max(floor, self.limit-4)
-            elif elapsed < budget*.6:
-                self.limit = min(C.MAX_KEYPOINTS, self.limit+2)
-            if (C.FEATURE_DETECTOR == "auto" and self.detector == "AGAST"
-                    and count >= used_limit*.8 and elapsed > budget*1.5):
-                self.detector = "FAST"
-        if count < C.MIN_MATCHES:
-            return None
-        sx, sy = C.IMAGE_WIDTH/work.width(), C.IMAGE_HEIGHT/work.height()
-        self.pixel_sigma = C.PIXEL_STD*max(sx, sy)
-        frame = GroundFrame(descriptor, q, height, camera_pos, stamp,
-            pixel_transform=(sx, sy, (sx-1)*.5, (sy-1)*.5), lazy=True)
-        cells, spread = frame.spread()
-        self.diagnostics.update(cells=cells, spread=spread, vision_reason="READY")
-        if cells < C.MIN_OCCUPIED_CELLS or spread < .01:
-            self.diagnostics["vision_reason"] = "FEATURES_1D" if spread < .01 else "FEATURES_CLUSTERED"
-            return None
-        return frame
-
-    def estimate(self, reference, current):
-        if self.probe is not None:
             start = _us()
-        matches = self.image_module.match_descriptor(reference.descriptor,
-            current.descriptor, threshold=C.MATCH_THRESHOLD, filter_outliers=False)
-        if self.probe is not None:
-            self.probe.record("match", _elapsed(start))
+            self.service()
+            self._record('vision_poll', start)
+
+    def _descriptor(self, image):
+        detector = C.FEATURE_DETECTOR
+        if detector == 'auto':
+            detector = 'AGAST' if self.empty_frames >= 3 else 'FAST'
+        corner = (self.image_module.CORNER_FAST if detector == 'FAST'
+                  else self.image_module.CORNER_AGAST)
+        threshold = C.KEYPOINT_THRESHOLD
+        start = _us()
+        descriptor = image.find_keypoints(threshold=threshold,
+            normalized=C.KEYPOINT_NORMALIZED, scale_factor=C.KEYPOINT_SCALE_FACTOR,
+            max_keypoints=C.MAX_KEYPOINTS, corner_detector=corner)
+        if (C.FEATURE_DETECTOR == 'auto' and detector == 'FAST'
+                and (descriptor is None or len(descriptor)<C.MIN_MATCHES)):
+            # A keyframe needs usable recovery descriptors now; waiting for
+            # future frames would lose the original reference image.
+            detector = 'AGAST'
+            descriptor = image.find_keypoints(threshold=threshold,
+                normalized=C.KEYPOINT_NORMALIZED, scale_factor=C.KEYPOINT_SCALE_FACTOR,
+                max_keypoints=C.MAX_KEYPOINTS, corner_detector=self.image_module.CORNER_AGAST)
+        self._record('features', start)
+        self.empty_frames = self.empty_frames+1 if descriptor is None or len(descriptor)<C.MIN_MATCHES else 0
+        self.diagnostics.update(detector_name=detector,detector=threshold,
+            normalized=C.KEYPOINT_NORMALIZED,limit=C.MAX_KEYPOINTS)
         self._service()
-        self.sequence += 1
-        return ransac_translation(reference, current, matches.match(), self.sequence,
-                                  self.diagnostics, self.probe)
+        return descriptor
+
+    def process(self, image, q, height, camera_pos, stamp):
+        if image.width()!=320 or image.height()!=240 or image.format()!=self.image_module.GRAYSCALE:
+            raise ValueError('rm_vo requires calibrated QVGA GRAYSCALE')
+        r = q_matrix(q)
+        rotation,arm = matmul(r,C.R_BC),rotate(r,camera_pos)
+        for i in range(9):
+            self.meta[i] = rotation[i]
+        for i in range(3):
+            self.meta[9+i] = arm[i]
+        self.meta[12] = height
+        self.timestamp[0], self.timestamp[1] = stamp & 0xFFFFFFFF, stamp >> 32
+        dt = 0.0 if self.last_stamp is None else max(0.0,(stamp-self.last_stamp)*1e-6)
+        age = None if self.velocity_stamp is None else stamp-self.velocity_stamp
+        predictive = age is not None and 0<=age<=C.PREDICTION_MAX_AGE_US
+        velocity = self.velocity if predictive else (0.0,0.0)
+        position = self.last_position or (0.0,0.0)
+        for i in range(2):
+            self.prediction[i] = position[i]+velocity[i]*dt
+        uncertainty = .5*C.PREDICTION_ACCEL_M_S2*dt*dt*max(C.FX,C.FY)/max(.05,height)
+        self.prediction[2] = (min(C.SEARCH_MAX_PX,C.SEARCH_MIN_PX+uncertainty)
+                             if predictive else C.SEARCH_MAX_PX)
+        self.diagnostics = dict(keypoints=0,matches=0,inliers=0,work_size=(320,240),
+            limit=C.MAX_KEYPOINTS,normalized=None,detector_name='KLT/SAD',
+            detector=C.FAST_THRESHOLD,vision_reason='MATCH_COUNT')
+        start = _us()
+        self.core.step(image,self.meta,self.timestamp,self.prediction,self.raw)
+        self._record('track_fit',start)
+        self._service()
+        used_orb = False
+        if int(self.raw[0])==0 and self.key_descriptor is not None:
+            descriptor = self._descriptor(image)
+            if descriptor is not None and len(descriptor)>=C.MIN_MATCHES:
+                start = _us()
+                match = self.image_module.match_descriptor(self.key_descriptor,descriptor,
+                    threshold=C.MATCH_THRESHOLD,filter_outliers=False)
+                packed = self.array('f')
+                used_source,used_target = set(),set()
+                for i,j in match.match():
+                    if i in used_source or j in used_target:
+                        continue
+                    used_source.add(i);used_target.add(j)
+                    a,b = self.key_descriptor[i],descriptor[j]
+                    # MicroPython array.extend requires a buffer, not a tuple.
+                    for value in (a[0],a[1],b[0],b[1]):
+                        packed.append(value)
+                    if len(used_source)>=64:
+                        break
+                self._record('match',start)
+                start = _us()
+                self.core.recover(image,self.meta,self.timestamp,packed,self.raw)
+                self._record('track_fit',start)
+                used_orb = int(self.raw[0])==2
+                self._service()
+        raw = self.raw
+        status,key_changed,base = int(raw[0]),bool(raw[15]),int(raw[16])
+        self.diagnostics.update(keypoints=int(raw[19]),matches=int(raw[6]),
+            inliers=int(raw[7]),cells=int(raw[9]),spread=raw[10],
+            klt=int(raw[20]),sad=int(raw[21]),orb=used_orb,reference='near' if base else 'key',
+            search_px=self.prediction[2],vision_reason='OK' if status==2 else 'MATCH_COUNT')
+        base_variance = self.previous_variance if base else self.key_variance
+        if key_changed:
+            self.key_descriptor = self._descriptor(image)
+        if status==2:
+            measured = (raw[1],raw[2])
+            if self.last_position is not None and 0<dt<=C.PREDICTION_MAX_AGE_US*1e-6:
+                self.velocity = tuple((measured[i]-self.last_position[i])/dt for i in range(2))
+                self.velocity_stamp = stamp
+            else:
+                self.velocity,self.velocity_stamp = (0.0,0.0),None
+            self.last_position,self.last_stamp = measured,stamp
+        elif status==1:
+            self.last_position,self.last_stamp = (0.0,0.0),stamp
+        return dict(status=status,position=(raw[1],raw[2]),delta=(raw[3],raw[4]),
+            residual_yaw=raw[5],matches=int(raw[6]),inliers=int(raw[7]),ratio=raw[8],
+            cells=int(raw[9]),spread=raw[10],residual_px=raw[11],
+            sample_variance=(raw[12],raw[13]),keyframe=int(raw[14]),key_changed=key_changed,
+            reference_height=raw[17],reference_dt=raw[18],base_variance=base_variance)
+
+    def accept_variance(self, motion, variance):
+        self.previous_variance = variance
+        if motion['key_changed']:
+            self.key_variance = variance
+
+    def predicted_pixel_speed(self, height, now):
+        if (height is None or height<=0 or self.velocity_stamp is None
+                or now-self.velocity_stamp>C.PREDICTION_MAX_AGE_US):
+            return 0.0
+        return max(C.FX,C.FY)*math.sqrt(sum(v*v for v in self.velocity))/height
+
+
+def native_settings():
+    from array import array
+    return array('f',(C.FX,C.FY,C.CX,C.CY)+C.DIST_COEFFS+(
+        C.MAX_KEYPOINTS,C.FAST_THRESHOLD,C.MIN_MATCHES,C.MIN_INLIERS,
+        C.MIN_INLIER_RATIO,C.MIN_OCCUPIED_CELLS,C.MIN_RAY_DOWN,C.RANSAC_THRESHOLD_PX,
+        C.MAX_RESIDUAL_YAW_RAD,C.SEARCH_MIN_PX,C.SEARCH_MAX_PX,C.KLT_MAX_ITERATIONS,
+        C.KLT_MAX_ERROR,C.KLT_FB_ERROR_PX,C.KEYFRAME_DISTANCE_HEIGHT_RATIO,
+        C.KEYFRAME_HEIGHT_RATIO,C.KEYFRAME_ROTATION_RAD,C.NEAR_REFERENCE_FLOW_PX,
+        C.FEATURE_TOPUP_RATIO,C.KLT_MIN_EIGENVALUE,C.RANSAC_MAX_ITERATIONS,
+        C.KEYFRAME_REFRESH_INLIER_RATIO))

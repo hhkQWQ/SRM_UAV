@@ -21,16 +21,15 @@ PHASES = (
     ("poll_before", "采图前通信/同步"), ("capture", "采图等待"),
     ("poll_after", "采图后通信/同步"), ("wait_attitude", "等待姿态"),
     ("camera", "曝光调节/统计"), ("vo_total", "VO总处理（含以下子项）"),
-    ("resize", "  缩图"), ("features", "  检测+ORB描述子"),
-    ("match", "  描述子匹配"), ("project", "  去畸变/投影"),
-    ("fit", "  RANSAC/精化"), ("vision_poll", "  视觉内通信"),
+    ("features", "  按需ORB检测/描述子"), ("match", "  ORB恢复匹配"),
+    ("track_fit", "  原生跟踪/投影/拟合"), ("vision_poll", "  视觉内通信"),
     ("image_stats", "  VO内纹理统计"), ("vo_other", "  VO其余逻辑"),
     ("housekeeping", "循环维护（含GC）"), ("gc", "  垃圾回收"),
     ("output", "发布检查/位姿摘要"), ("test_output", "测试诊断输出"),
     ("cycle", "完整循环"),
 )
 INDEX = {name: i for i, (name, _) in enumerate(PHASES)}
-VO_PARTS = ("resize", "features", "match", "project", "fit", "vision_poll", "image_stats")
+VO_PARTS = ("features", "match", "track_fit", "vision_poll", "image_stats")
 
 
 def number(value, digits=1):
@@ -50,7 +49,7 @@ def history_hz(history):
 class Samples:
     """固定容量的原生整数数组；不保存图像，不逐帧打印。"""
     def __init__(self, capacity=SAMPLE_CAPACITY):
-        self.values = array("I", [0])*capacity
+        self.values = array("I", [0]*capacity)
         self.count = self.total = self.maximum = 0
 
     def add(self, value):
@@ -82,7 +81,7 @@ class TestSession:
         self.active = False
         self.last_detail = None
         self.measure_start = None
-        self.frames = self.valid_frames = self.loops = self.over_budget = 0
+        self.frames = self.valid_frames = self.loops = 0
         self.reasons = {}
 
     def prepare(self, sensor, link, controller, capture, adapter, output):
@@ -91,8 +90,8 @@ class TestSession:
         # 测试入口只观察VO；即使正式配置开启发布，也不回传测试中的ODOMETRY。
         output.publish = False
         output.display = self.mode == 2  # 模式2保留正式摘要，计入其实际开销
-        print("测试模式=%d | 采图=%dx%d 特征缩放=%.2f 缓冲=%d | 测试期间不发布ODOMETRY" % (
-            self.mode, C.IMAGE_WIDTH, C.IMAGE_HEIGHT, C.FEATURE_SCALE, C.FRAME_BUFFERS))
+        print("测试模式=%d | 全程=%dx%d 缓冲=%d | 测试期间不发布ODOMETRY" % (
+            self.mode, C.IMAGE_WIDTH, C.IMAGE_HEIGHT, C.FRAME_BUFFERS))
         if self.mode == 2:
             print("流程：采图基线%.1fs -> 链路预热%.1fs -> 完整流程采样%.1fs；保留正式位姿摘要。" % (
                 BASELINE_SECONDS, WARMUP_SECONDS, MEASURE_SECONDS))
@@ -155,7 +154,6 @@ class TestSession:
         else:
             reason = "NO_NEW_FRAME"
         self.reasons[reason] = self.reasons.get(reason, 0)+1
-        self.over_budget += int(self.values[INDEX["cycle"]] > 1000000/C.TARGET_FPS)
         elapsed = _elapsed(self.measure_start)
         if elapsed < MEASURE_SECONDS*1000000:
             return False
@@ -191,7 +189,7 @@ class TestSession:
         else:
             print("视觉 | 未执行：%s" % _state(result["reason"]))
         parts = []
-        for name in ("capture", "wait_attitude", "resize", "features", "match", "project", "fit", "vo_total"):
+        for name in ("capture", "wait_attitude", "features", "match", "track_fit", "vo_total"):
             i = INDEX[name]
             parts.append("%s=%s" % (PHASES[i][1].strip(),
                 "%.2fms" % (self.values[i]*.001) if self.seen[i] else "未执行"))
@@ -206,8 +204,8 @@ class TestSession:
         print("\nFPS测量完成 | %.2fs 新图像=%d 实际=%.2fHz 有效定位=%.2fHz 有效率=%.1f%%" % (
             elapsed*1e-6, self.frames, hz, self.valid_frames*1000000.0/max(1, elapsed),
             self.valid_frames*100.0/max(1, self.frames)))
-        print("目标=%.1fHz 周期预算=%.2fms | 超预算=%d/%d | P50/P95使用各阶段最近最多%d次，平均/最大值覆盖全部。" % (
-            C.TARGET_FPS, 1000/C.TARGET_FPS, self.over_budget, self.loops, SAMPLE_CAPACITY))
+        print("循环=%d | 不设目标帧率；P50/P95使用各阶段最近最多%d次，平均/最大值覆盖全部。" % (
+            self.loops, SAMPLE_CAPACITY))
         print("阶段 | 执行次数 | 平均/P50/P95/最大 ms | 占循环时间")
         for i, (_, label) in enumerate(PHASES):
             samples = self.stats[i]
@@ -221,7 +219,7 @@ class TestSession:
         overhead = max(0, elapsed-cycle_total)
         print("统计管理/未分项间隙 | %.2fms/循环 | %.1f%%测量墙钟时间" % (
             overhead*.001/max(1, self.loops), overhead*100.0/max(1, elapsed)))
-        print("说明：VO总处理包含缩图至其余逻辑；循环维护包含GC，父子项不能相加。采图耗时含等待，不等于CPU占用。")
+        print("说明：VO总处理包含原生计算与其余逻辑；循环维护包含GC，父子项不能相加。采图耗时含等待，不等于CPU占用。")
         print("状态分布 | "+" | ".join("%s=%d" % (_state(name), count) for name, count in self.reasons.items()))
         now = self.link.clock.now_us()
         print("输入核对 | 连接=%s 同步=%s | 姿态/测距=%s/%sHz | RTT=%sms CRC错误=%d" % (
@@ -231,7 +229,7 @@ class TestSession:
             self.link.parser.bad_crc))
         # 排序使用互不重叠的阶段，避免将VO父项与其子项重复计入。
         names = ("poll_before", "capture", "poll_after", "wait_attitude", "camera",
-                 "resize", "features", "match", "project", "fit", "vision_poll", "image_stats",
+                 "features", "match", "track_fit", "vision_poll", "image_stats",
                  "vo_other", "housekeeping", "output")
         ranked = sorted(((self.stats[INDEX[name]].total, name) for name in names), reverse=True)
         print("耗时前三项 | "+" | ".join("%s=%.1f%%" % (
@@ -239,7 +237,7 @@ class TestSession:
         top = ranked[0][1]
         if top == "capture":
             print("判断线索：采图等待最多。对照采图基线，检查读出、缓冲和错过帧；尚不能仅凭此认定传感器硬限速。")
-        elif top in ("features", "resize", "match", "project", "fit", "vo_other"):
+        elif top in ("features", "match", "track_fit", "vo_other"):
             print("判断线索：视觉阶段耗时最多，优先针对上表中的具体阶段优化。")
         else:
             print("判断线索：通信、等待或维护开销较高，先检查对应阶段，不宜先减少视觉信息。")

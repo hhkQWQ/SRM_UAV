@@ -15,8 +15,16 @@ from algorithm import _us, _elapsed
 def validate_config():
     if C.STREAM_POLICY not in ("auto", "listen", "request"):
         raise ValueError("invalid STREAM_POLICY")
-    if not 0 < C.FEATURE_SCALE <= 1 or C.TARGET_FPS <= 0:
-        raise ValueError("invalid feature scale or FPS budget")
+    if (C.IMAGE_WIDTH, C.IMAGE_HEIGHT) != (320, 240):
+        raise ValueError("native VO requires calibrated QVGA")
+    if C.FRAME_BUFFERS != 1:
+        raise ValueError("4.5.9 requires one capture buffer for unambiguous image timestamps")
+    if not C.MIN_MATCHES <= C.MAX_KEYPOINTS <= 64:
+        raise ValueError("native feature capacity is 64")
+    if any(v <= 0 for v in (C.ATTITUDE_HZ, C.RANGE_HZ, C.ODOMETRY_HZ, C.DISPLAY_HZ)):
+        raise ValueError("stream and output frequencies must be positive")
+    if not 0 < C.EXPOSURE_MIN_US <= C.EXPOSURE_MAX_US or C.MAX_BLUR_PX <= 0:
+        raise ValueError("invalid exposure or blur settings")
     if C.FEATURE_DETECTOR not in ("auto", "FAST", "AGAST"):
         raise ValueError("invalid feature detector")
     if C.MAX_KEYPOINTS < C.MIN_MATCHES or not 1 <= C.MIN_INLIERS <= C.MIN_MATCHES:
@@ -70,7 +78,7 @@ def setup_camera():
             sensor.skip_frames(time=500)
         except (AttributeError, OSError) as error:
             print("相机对焦未完成，请检查清晰度：%s" % error)
-    # 不指定帧率上限、不依靠重复旧图像凑30FPS；真实帧率在循环中统计。
+    # 不设置帧率上限；真实帧率在循环中统计。
     return sensor
 
 
@@ -101,6 +109,8 @@ class Capture:
             stamp = self.clock.from_ticks(raw)
         else:
             stamp = self.clock.now_us()
+            self.done_sequence = (self.done_sequence+1) & 0x3FFFFFFF
+            self.last_sequence = self.done_sequence
         # 返回/帧完成时刻不等于曝光中点，必须测量并填写偏移。
         return image, stamp+C.CAMERA_TIME_OFFSET_US
 
@@ -114,7 +124,7 @@ class CameraAdapter:
         self.manual = False
         self.settings = None
 
-    def update(self, image, now, gyro=(0.0, 0.0, 0.0)):
+    def update(self, image, now, gyro=(0.0, 0.0, 0.0), pixel_speed=0.0):
         if not C.CAMERA_AUTO_TUNE or now-self.last_us < 500000:
             return
         self.last_us = now
@@ -122,12 +132,13 @@ class CameraAdapter:
         mean = statistics.mean()
         old_exp, old_gain = self.sensor.get_exposure_us(), self.sensor.get_gain_db()
         speed = math.sqrt(sum(v*v for v in gyro))
-        cap = min(12000.0, 350000.0/max(1, C.TARGET_FPS))
-        if math.isfinite(speed) and speed > 0.01:
-            cap = min(cap, 2000000.0/(max(C.FX, C.FY)*speed))
-        cap = max(2000, int(cap))
+        cap = C.EXPOSURE_MAX_US
+        motion = max(0.0, pixel_speed)+max(C.FX, C.FY)*speed
+        if math.isfinite(motion) and motion > .01:
+            cap = min(cap, C.MAX_BLUR_PX*1000000.0/motion)
+        cap = max(C.EXPOSURE_MIN_US, int(cap))
         ratio = max(.8, min(1.25, 100.0/max(1, mean)))
-        exposure = max(2000, min(cap, int(old_exp*ratio)))
+        exposure = max(C.EXPOSURE_MIN_US, min(cap, int(old_exp*ratio)))
         gain = max(0.0, min(30.0, old_gain+20*math.log10(max(.01, ratio*old_exp/exposure))))
         # 首次接管自动模式；之后忽略很小的变化，减少重复寄存器写入。
         if not self.manual or abs(exposure-old_exp) >= max(100, old_exp*.02):
@@ -172,6 +183,7 @@ def run(observer=None):
         observer.prepare(sensor, link, controller, capture, camera_adapter, output)
     window_start = link.clock.now_us()
     frames, fps = 0, 0.0
+    last_height = None
     while True:
         if observer is not None:
             observer.begin_frame()
@@ -193,10 +205,13 @@ def run(observer=None):
             observer.mark("wait_attitude")
         process_start = link.clock.now_us()
         gyro = link.attitudes[-1][2] if link.attitudes else (0.0, 0.0, 0.0)
-        statistics = camera_adapter.update(image, process_start, gyro)
+        pixel_speed = controller.engine.predicted_pixel_speed(last_height, stamp)
+        statistics = camera_adapter.update(image, process_start, gyro, pixel_speed)
         if observer is not None:
             observer.mark("camera")
         result = controller.process(image, stamp, link, statistics=statistics)
+        last_height = result["height"]
+        result["frame_sequence"] = capture.last_sequence
         if observer is not None:
             observer.mark("vo_total")
         frames += 1
@@ -204,6 +219,7 @@ def run(observer=None):
         if now-window_start >= 1000000:
             fps = frames*1000000.0/(now-window_start)
             frames, window_start = 0, now
+        if hasattr(gc, "mem_free") and gc.mem_free() < C.GC_LOW_WATER_BYTES:
             if observer is not None:
                 gc_start = _us()
             gc.collect()
