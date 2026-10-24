@@ -1,4 +1,4 @@
-"""OpenMV入口。正常运行main.py；详细诊断与性能测量运行test.py。
+"""OpenMV入口。正常运行main.py；事件摘要与全程测试日志运行test.py。
 
 只显示位姿、离地高度、帧率和质量摘要。默认不回传有效ODOMETRY。
 """
@@ -174,11 +174,12 @@ def run(observer=None):
     sensor = setup_camera()
     link = FlightLink()
     controller = VOController()
+    probe = observer if observer is not None and getattr(observer, "timing", True) else None
     controller.engine.service = link.poll
-    controller.engine.probe = observer
+    controller.engine.probe = probe
     output = Output(link)
     capture = Capture(sensor, link.clock)
-    camera_adapter = CameraAdapter(sensor, observer)
+    camera_adapter = CameraAdapter(sensor, probe)
     if observer is not None:
         observer.prepare(sensor, link, controller, capture, camera_adapter, output)
     window_start = link.clock.now_us()
@@ -220,11 +221,11 @@ def run(observer=None):
             fps = frames*1000000.0/(now-window_start)
             frames, window_start = 0, now
         if hasattr(gc, "mem_free") and gc.mem_free() < C.GC_LOW_WATER_BYTES:
-            if observer is not None:
+            if probe is not None:
                 gc_start = _us()
             gc.collect()
-            if observer is not None:
-                observer.record("gc", _elapsed(gc_start))
+            if probe is not None:
+                probe.record("gc", _elapsed(gc_start))
         if observer is not None:
             observer.mark("housekeeping")
         output.update(result, fps)

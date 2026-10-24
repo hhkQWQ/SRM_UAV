@@ -28,30 +28,51 @@ def _state(code):
     return _STATES.get(code, code)
 
 
+def publication_blockers(result, link, now):
+    """真实发布和测试干跑共用；不含SEND_ODOMETRY或测试发布开关。"""
+    checks = (("TIMING_UNCONFIRMED", C.SENSOR_TIMING_CONFIRMED),
+              ("POSITION_INVALID", result["valid"]),
+              ("EXTRINSICS_UNCONFIRMED", result["body_valid"]),
+              ("LOW_QUALITY", result["quality"] >= C.MIN_PUBLISH_QUALITY),
+              ("DISCONNECTED", link.connected(now)), ("UNSYNCED", link.synced(now)),
+              ("OBSERVATION_STALE", 0 <= now-result["timestamp_us"] <= C.MAX_TX_AGE_US))
+    return tuple(name for name, ok in checks if not ok)
+
+
+class PublicationGate:
+    """按图像时间戳去重及限频；测试只运行此准入，不进入发送队列。"""
+    def __init__(self):
+        self.last_publish = -10000000
+        self.last_stamp = -1
+
+    def accept(self, result, now, blockers):
+        if (blockers or result["timestamp_us"] <= self.last_stamp
+                or now-self.last_publish < int(1000000/C.ODOMETRY_HZ)):
+            return False
+        self.last_publish, self.last_stamp = now, result["timestamp_us"]
+        return True
+
+
 class Output:
     def __init__(self, link, display=True, publish=True):
         self.link = link
         self.display = display
         self.publish = publish
         self.last_display = -10000000
-        self.last_publish = -10000000
-        self.last_stamp = -1
+        self.gate = PublicationGate()
 
     def update(self, result, fps):
         now = self.link.clock.now_us()
         # 发布与失效取消逐帧检查，不能被显示/诊断限频挡住。
-        allowed = (self.publish and C.SEND_ODOMETRY and C.SENSOR_TIMING_CONFIRMED
-                   and result["valid"] and result["body_valid"]
-                   and result["quality"] >= C.MIN_PUBLISH_QUALITY
-                   and self.link.connected(now) and self.link.synced(now)
-                   and 0 <= now-result["timestamp_us"] <= C.MAX_TX_AGE_US)
+        blockers = ()
+        allowed = self.publish and C.SEND_ODOMETRY
+        if allowed:
+            blockers = publication_blockers(result, self.link, now)
+            allowed = not blockers
         if not allowed:
             self.link.cancel_odometry()
-        elif (result["timestamp_us"] > self.last_stamp
-              and now-self.last_publish >= int(1000000/C.ODOMETRY_HZ)):
+        elif self.gate.accept(result, now, blockers):
             self.link.send_odometry(result)
-            self.last_publish = now
-            self.last_stamp = result["timestamp_us"]
         if self.display and now-self.last_display >= int(1000000/C.DISPLAY_HZ):
             self.last_display = now
             self._summary(result, fps)

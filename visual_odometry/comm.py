@@ -213,6 +213,9 @@ class FlightLink:
         self.request_after_us = 0
         self.next_stream_check_us = 0
         self.last_odometry_stamp = -1
+        # 跨飞控重启保留的本次运行接收计数；不依赖有限长度历史环。
+        self.attitude_received = self.range_received = 0
+        self.sync_received = 0
 
     def connected(self, now=None):
         now = self.clock.now_us() if now is None else now
@@ -338,6 +341,7 @@ class FlightLink:
         if self.target != (sysid, compid):
             return
         if msgid == 31:
+            self.attitude_received += 1
             values = struct.unpack("<Ifffffff", payload_padded(payload, 32))
             boot = values[0]
             if self.last_boot_ms is not None:
@@ -366,6 +370,7 @@ class FlightLink:
                     return
                 self.range_id = sid
             quality = p[38] if len(payload) >= 39 else 0
+            self.range_received += 1
             self._history(self.ranges, (self._stamp(stamp)+C.RANGE_TIME_OFFSET_US,
                           distance*0.01, minimum*0.01, maximum*0.01,
                           quality, None if variance == 255 else variance*0.0001, now))
@@ -375,6 +380,7 @@ class FlightLink:
             if tc1 == 0:
                 self._queue(111, pack_i64(now*1000)+pack_i64(ts1))
             elif self.pending_sync is not None and ts1 == self.pending_sync[0]:
+                self.sync_received += 1
                 sent = self.pending_sync[1]
                 self.pending_sync = None
                 rtt = now-sent
