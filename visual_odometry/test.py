@@ -1,41 +1,50 @@
-"""事件触发测试：MODE1简略观察；MODE2同样显示，退出时保存全程统计。"""
+"""MODE1轻量观察及总结；MODE2另存精简诊断，测量期间不写文件。"""
 MODE = 1
-DEBUG_VERSION = 'usb-buffer-2'
+DEBUG_VERSION = 'sparse-vo-2'
 RATE_WINDOW_US = 2000000
 EVENT_DISPLAY_INTERVAL_US = 1000000
-LOG_DIRECTORY = None       # None: 优先/sd/logs，否则/flash/logs；PC使用./logs
-EVENT_BUFFER_SIZE = 8      # 有界事件缓冲；不保存图像或逐帧历史
+LOG_DIRECTORY = None
+EVENT_BUFFER_SIZE = 16
 
 import gc
 import math
 import os
 import sys
 from array import array
-import config as C
-from algorithm import _us, _elapsed, euler_degrees
-from output import _state, publication_blockers, PublicationGate
-from control import range_invalid_detail
+from algorithm import _us, _elapsed
+from output import BLOCK_CODES, publication_block_mask, PublicationGate
 from main import run
+import config as C
 
-PHASES = (
-    ("poll_before", "采图前通信/同步"), ("capture", "采图等待"),
-    ("poll_after", "采图后通信/同步"), ("wait_attitude", "等待姿态"),
-    ("camera", "曝光调节/统计"), ("vo_total", "VO总处理（含子项）"),
-    ("features", "  按需ORB检测/描述子"), ("match", "  ORB恢复匹配"),
-    ("track_fit", "  原生跟踪/投影/拟合"), ("vision_poll", "  视觉内通信"),
-    ("image_stats", "  VO内纹理统计"), ("vo_other", "  VO其余逻辑"),
-    ("housekeeping", "循环维护（含GC）"), ("gc", "  垃圾回收"),
-    ("output", "发布检查"), ("test_output", "调试输入/输出及日志"),
-    ("cycle", "完整循环（含统计前的调试开销）"))
+PHASES = (('capture', '采图/相机调节'), ('communication', '通信/输入等待'),
+          ('vision', '视觉总处理'), ('gc', '显式GC'), ('debug', '调试统计/输入输出'),
+          ('cycle', '完整循环'),
+          ('native_warp', '  补偿/窗口重采样'), ('native_klt', '  KLT正反向'),
+          ('native_sad', '  SAD搜索/歧义检查'), ('native_detect', '  FAST补点'),
+          ('native_fit', '  平移拟合'), ('native_copy', '  参考图复制'))
 INDEX = {name: i for i, (name, _) in enumerate(PHASES)}
-VO_PARTS = ("features", "match", "track_fit", "vision_poll", "image_stats")
-BLOCK_NAMES = {"TIMING_UNCONFIRMED": "时序未确认", "POSITION_INVALID": "位置无效",
-    "EXTRINSICS_UNCONFIRMED": "外参未确认或机体位置无效", "LOW_QUALITY": "质量不足",
-    "DISCONNECTED": "飞控未连接", "UNSYNCED": "时钟未同步", "OBSERVATION_STALE": "观测过期或时间在未来"}
-
-
-def increment(table, key, count=1):
-    table[key] = table.get(key, 0)+count
+DETAIL_NAMES = ('匹配数', '内点数', '像素残差')
+BLOCK_NAMES = ('时序未确认', '位置无效', '外参未确认或机体位置无效', '质量不足',
+               '飞控未连接', '时钟未同步', '观测过期或时间在未来')
+FAILURES = (
+    ('NO_FEATURES', '特征不足', 0), ('LOST', '视觉跟踪失败，原因未细分', 0),
+    ('MATCH_COUNT', '可靠匹配不足', 0), ('INLIER_RATIO', '一致匹配比例不足', 0),
+    ('AMBIGUOUS_MATCH', '少点匹配有歧义', 0), ('PATCH_UNRELIABLE', '窗口跟踪不可靠', 0),
+    ('INPUT_INVALID', '视觉输入无效', 1), ('LOW_TEXTURE', '图像纹理不足', 0), ('DYNAMIC_LIMIT', '动态限制', 0),
+    ('VIBRATION', '振动超限', 0), ('WAIT_HEARTBEAT', '等待飞控连接', 1),
+    ('TIME_UNSYNCED', '时间未同步', 1), ('WAIT_ATTITUDE', '图像时刻缺少姿态', 1),
+    ('EXTRINSICS_PENDING', '安装参数未确认', 1), ('WAIT_RANGE', '等待测距', 1),
+    ('WAIT_RANGE_ATTITUDE', '测距时刻缺少姿态', 1),
+    ('RANGE_ATTITUDE_GAP', '测距缺少对应姿态', 1), ('RANGE_INVALID', '测距无效', 1),
+    ('RANGE_TILT', '测距倾角或地面交点无效', 1), ('RANGE_JUMP', '测距突变', 1),
+    ('RANGE_STALE', '测距过期', 1), ('SELECT_TOF_ID', '测距器ID不明确', 1),
+    ('ATTITUDE_RESET', '飞控姿态跳变', 1), ('OTHER', '其他未分类失效', 2))
+FAILURE_INDEX = {item[0]: i for i, item in enumerate(FAILURES)}
+INITIAL_STATES = ('INITIALIZING', 'REINITIALIZING')
+RECOVERY_STATES = ('POSE_RECOVERING', 'RANGE_RECOVERING')
+WARMUP_STATES = INITIAL_STATES+RECOVERY_STATES
+DISPLAY_STATES = ('初始化', '跟踪正常', '位置无效', '少点跟踪')
+EVENT_NAMES = ('连接变化', '同步变化', '进入失跟', '恢复跟踪', '轨迹重置', '测距异常', '程序异常')
 
 
 def exception_text(exception):
@@ -52,35 +61,10 @@ def exception_text(exception):
         return repr(exception)
 
 
-class Metric:
-    """常量空间全程统计；无效数值单独计数。"""
-    def __init__(self):
-        self.count = self.invalid = 0
-        self.total = 0.0
-        self.minimum = self.maximum = self.last = None
-
-    def add(self, value):
-        if value is None or not math.isfinite(value):
-            self.invalid += 1
-            return
-        self.count += 1
-        self.total += value
-        self.minimum = value if self.minimum is None else min(self.minimum, value)
-        self.maximum = value if self.maximum is None else max(self.maximum, value)
-        self.last = value
-
-    def text(self, scale=1.0):
-        if not self.count:
-            return "无有效样本/未执行 | 无效=%d" % self.invalid
-        return "样本=%d 无效=%d | 最小/平均/最大/最后=%.4f/%.4f/%.4f/%.4f" % (
-            self.count, self.invalid, self.minimum*scale, self.total/self.count*scale,
-            self.maximum*scale, self.last*scale)
-
-
-# 保留原验证脚本所使用的固定容量Samples接口；新日志使用全程Metric。
+# 仅供旧原生验证脚本使用；两种测试模式均不实例化该样本数组。
 class Samples:
     def __init__(self, capacity=256):
-        self.values = array("I", [0]*capacity)
+        self.values = array('I', [0]*capacity)
         self.count = self.total = self.maximum = 0
 
     def add(self, value):
@@ -92,7 +76,7 @@ class Samples:
 
 
 class Console:
-    """USB VCP原始终端非阻塞输入；绝不读取IDE调试协议字节。"""
+    """复用USB接收缓冲；只使用原始终端，不读取IDE调试协议。"""
     def __init__(self):
         self.vcp = self.poller = None
         self.rx_buffer = bytearray(64)
@@ -102,7 +86,7 @@ class Console:
             from pyb import USB_VCP
             self.vcp = USB_VCP()
             if self.vcp.debug_mode_enabled():
-                raise RuntimeError("请断开IDE主调试连接，再通过工具→打开终端的串口连接运行test.main()")
+                raise RuntimeError('请断开IDE主调试连接，通过原始USB串口终端运行test.main()')
         except ImportError:
             import select
             self.poller = select.poll()
@@ -110,17 +94,17 @@ class Console:
 
     def read(self):
         if self.vcp is not None:
-            # any()只判断是否有输入；recv使用复用的可写缓冲区并返回实际字节数。
             if not self.vcp.any():
-                return b""
+                return b''
             count = self.vcp.recv(self.rx_buffer, timeout=0)
-            return self.rx_view[:count] if count else b""
+            return self.rx_view[:count] if count else b''
         if not self.poller.poll(0):
-            return b""
-        # stdin非阻塞就绪后只取一个字符；不使用阻塞readline。
+            return b''
         return sys.stdin.read(1).encode()
 
     def commands(self, data):
+        if not data:
+            return ()
         actions = []
         for value in data:
             if value == 10 and self.after_cr:
@@ -128,15 +112,65 @@ class Console:
                 continue
             self.after_cr = value == 13
             if value in (10, 13):
-                actions.append("origin")
+                actions.append('origin')
             elif value in (ord('q'), ord('Q')):
-                actions.append("query")
+                actions.append('query')
             elif value in (ord('x'), ord('X')):
-                actions.append("exit")
+                actions.append('exit')
         return actions
 
     def poll(self):
         return self.commands(self.read())
+
+
+class EventBuffer:
+    """固定数值环：每条17字节载荷，不缓存文本，相邻重复事件合并。"""
+    def __init__(self, capacity=EVENT_BUFFER_SIZE):
+        if capacity < 1:
+            raise ValueError('event capacity must be positive')
+        self.capacity = capacity
+        self.low = array('I', [0]*capacity)
+        self.high = array('I', [0]*capacity)
+        self.codes = bytearray(capacity)
+        self.arguments = array('I', [0]*capacity)
+        self.repeats = array('I', [0]*capacity)
+        self.start = self.count = self.overwritten = self.total = 0
+
+    def add(self, offset_ms, code, argument=0):
+        self.total += 1
+        argument = max(0, min(0xFFFFFFFF, int(argument)))
+        if self.count:
+            last = (self.start+self.count-1) % self.capacity
+            if self.codes[last] == code and self.arguments[last] == argument:
+                self.repeats[last] = min(0xFFFFFFFF, self.repeats[last]+1)
+                return
+        if self.count < self.capacity:
+            slot = (self.start+self.count) % self.capacity
+            self.count += 1
+        else:
+            slot = self.start
+            self.start = (self.start+1) % self.capacity
+            self.overwritten += 1
+        offset_ms = max(0, int(offset_ms))
+        self.low[slot], self.high[slot] = offset_ms & 0xFFFFFFFF, offset_ms >> 32
+        self.codes[slot], self.arguments[slot], self.repeats[slot] = code, argument, 1
+
+    def lines(self):
+        for i in range(self.count):
+            slot = (self.start+i) % self.capacity
+            stamp = self.low[slot]+(self.high[slot] << 32)
+            code, argument = self.codes[slot], self.arguments[slot]
+            if code in (0, 1):
+                detail = '恢复' if argument else '失效'
+            elif code in (2, 5):
+                detail = FAILURES[argument][1]
+            elif code == 3:
+                detail = '失跟持续%dms' % argument
+            elif code == 4:
+                detail = 'reset_counter=%d' % argument
+            else:
+                detail = '见结束原因'
+            yield '[%.3fs] %s：%s；重复=%d\n' % (stamp*.001, EVENT_NAMES[code], detail, self.repeats[slot])
 
 
 def is_directory(path):
@@ -147,480 +181,441 @@ def is_directory(path):
 
 
 class SessionLog:
+    """只在退出后创建，逐段写报告，不拼接整份文本。"""
     def __init__(self, directory=None):
-        self.file = None
-        self.pending = []
         self.error = None
         if directory is None:
-            if is_directory('/sd'):
-                directory = '/sd/logs'
-            elif is_directory('/flash'):
-                directory = '/flash/logs'
-            else:
-                directory = 'logs'
+            directory = '/sd/logs' if is_directory('/sd') else '/flash/logs' if is_directory('/flash') else 'logs'
         if not is_directory(directory):
             os.mkdir(directory)
         index = 1
         while True:
-            path = '%s/vo_test_%04d.txt' % (directory, index)
+            self.path = '%s/vo_test_%04d.txt' % (directory, index)
             try:
-                os.stat(path)
+                os.stat(self.path)
             except OSError:
                 break
             index += 1
-        self.path = path
-        self.file = open(path, 'w')
-        self.write('MODE2测试日志\n调试版本=%s\n状态=运行中；缺少“日志完成”表示未完成最终汇总。\n' % DEBUG_VERSION)
-        self.flush()
+        self.file = open(self.path, 'wb')
 
     def write(self, text):
-        if self.error is not None:
-            return
-        try:
-            self.file.write(text)
-        except OSError as error:
-            self.error = repr(error)
-
-    def event(self, text):
-        self.pending.append(text)
-        if len(self.pending) >= EVENT_BUFFER_SIZE:
-            self.flush()
-
-    def flush(self):
-        if self.pending:
-            self.write(''.join(self.pending))
-            self.pending = []
         if self.error is None:
             try:
-                self.file.flush()
+                self.file.write(text.encode('utf-8'))
             except OSError as error:
                 self.error = repr(error)
 
     def close(self):
-        self.flush()
         try:
             self.file.close()
         except OSError as error:
             self.error = repr(error)
 
 
+def number(value, digits=2):
+    return '--' if value is None else ('%.'+str(digits)+'f') % value
+
+
 class TestSession:
     def __init__(self, mode=MODE, console=None, log_directory=None):
         if mode not in (1, 2):
-            raise ValueError('MODE must be 1 (summary) or 2 (summary + final log)')
+            raise ValueError('MODE must be 1 or 2')
         self.mode, self.timing = mode, mode == 2
         self.console, self.log_directory = console, log_directory
-        self.log = self.link = None
+        self.link = self.log = None
         self.closed = self.active = False
-        self.values = [0]*len(PHASES)
-        self.seen = [False]*len(PHASES)
-        self.phases = [Metric() for _ in PHASES] if self.timing else None
-        self.metrics, self.reasons, self.blockers, self.durations = {}, {}, {}, {}
-        self.frames = self.valid_frames = self.publish_frames = self.loops = 0
+        self.start = self.end = None
+        self.frames = self.valid_frames = self.publish_frames = 0
+        self.quality_sum = self.quality_count = 0
+        self.initial_frames = self.recovery_frames = self.no_new_loops = 0
+        self.last_stamp = self.last_sequence = None
+        self.last_result = self.epoch = None
         self.gate = PublicationGate()
-        self.rate_start = None
-        self.rate_counts = [0, 0, 0]
-        self.rates = (0.0, 0.0, 0.0)
-        self.rate_ready = False
-        self.origin = self.segment = None
+        self.failure_counts = array('I', [0]*len(FAILURES))
+        self.loss_counts = array('I', [0]*len(FAILURES))
+        self.had_tracking = self.in_loss = False
+        self.loss_start = None
+        self.lost_episodes = self.reset_events = 0
+        self.origin = None
         self.origin_id = 0
         self.pending_origin = False
-        self.epoch = self.last_result = self.state_key = None
+        self.rate_start = None
+        self.rate_counts = array('I', [0, 0, 0])
+        self.rates = [0.0, 0.0, 0.0]  # 处理Hz、可发布Hz、有效率；无有效定位Hz。
+        self.rate_ready = False
         self.last_display = -EVENT_DISPLAY_INTERVAL_US
+        self.display_state = self.health = None
         self.pending_display = False
-        self.start = self.last_state_at = None
-        self.events = self.lost_episodes = self.orb_attempts = self.orb_success = 0
-        self.reset_events = 0
-        self.health_changes = {}
-        self.last_vision = None
-        self.last_camera_sample = -1000000
-        self.last_sync_received = 0
-        self.last_ack = None
-        self.latest_blockers = ()
+        self.last_range_failure = None
+        self.events = EventBuffer() if self.timing else None
+        self.block_counts = array('I', [0]*len(BLOCK_CODES)) if self.timing else None
+        self.values = array('I', [0]*len(PHASES)) if self.timing else None
+        self.phase_counts = array('I', [0]*len(PHASES)) if self.timing else None
+        # Python整数累计微秒，避免uint32约71分钟后溢出。
+        self.phase_totals = [0]*len(PHASES) if self.timing else None
+        self.phase_maximum = array('I', [0]*len(PHASES)) if self.timing else None
+        self.seen = 0
+        self.detail_counts = array('I', [0, 0, 0]) if self.timing else None
+        self.detail_sums = [0.0, 0.0, 0.0] if self.timing else None
+        self.detail_minimum = [0.0, 0.0, 0.0] if self.timing else None
+        self.detail_maximum = [0.0, 0.0, 0.0] if self.timing else None
+        self.minimum_heap = None
+        self.last_heap_sample = -1000000
+        self.sparse_frames = 0
 
     def prepare(self, sensor, link, controller, capture, adapter, output):
-        self.sensor, self.link, self.controller = sensor, link, controller
-        self.output = output
+        self.link = link
         output.publish = output.display = False
-        self.start = self.rate_start = self.last_state_at = link.clock.now_us()
-        self.rx_start = (getattr(link, 'attitude_received', 0), getattr(link, 'range_received', 0))
-        if self.timing:
-            self.log = SessionLog(self.log_directory if self.log_directory is not None else LOG_DIRECTORY)
-            self.log.write('配置快照（启动值）\n')
-            for key in sorted(dir(C)):
-                if key.isupper():
-                    self.log.write('%s=%r\n' % (key, getattr(C, key)))
-            self.log.flush()
         if self.console is None:
             self.console = Console()
-        print('MODE%d | 调试版本=%s | Enter=建立/更新初始点 q=查询 x=结束 | 测试不发送ODOMETRY' % (
-            self.mode, DEBUG_VERSION))
-        print('ΔN/ΔE为飞控NED轴的相对位移；等待Enter建立初始点。请使用原始终端，q/x无需回车。')
-        if self.log is not None:
-            print('日志=%s | 运行中累计统计，结束后写入全程报告。' % self.log.path)
+        if self.timing:
+            self.rx_start = (getattr(link, 'attitude_received', 0), getattr(link, 'range_received', 0),
+                             link.parser.bad_crc, link.sync_rtt_rejected)
+            self.start_config = (C.IMAGE_WIDTH, C.IMAGE_HEIGHT, C.MAX_KEYPOINTS,
+                C.FAST_THRESHOLD, C.KLT_MAX_ITERATIONS, C.EXPOSURE_US, C.GAIN_DB,
+                C.MIN_PUBLISH_QUALITY, C.ODOMETRY_HZ, C.SENSOR_TIMING_CONFIRMED,
+                C.CAMERA_ORIENTATION_CONFIRMED)
+        print('MODE%d | %s | Enter=更新原点 q=查询 x=结束 | 测试不发送ODOMETRY' % (self.mode, DEBUG_VERSION))
+        print('ΔN/ΔE沿飞控NED轴；有效定位时按Enter建立参考。退出时输出总结。')
+        if self.timing:
+            print('MODE2只在退出后保存日志；断电/硬复位会丢失未保存统计。')
 
     def begin_frame(self):
-        if not self.timing:
-            return
-        for i in range(len(PHASES)):
-            self.values[i], self.seen[i] = 0, False
-        self.frame_start = self.cursor = _us()
-        self.active = True
+        now = self.link.clock.now_us()
+        if self.start is None:
+            self.start = self.end = self.rate_start = now
+        if self.timing:
+            for i in range(len(PHASES)):
+                self.values[i] = 0
+            self.seen = 0
+            self.frame_start = self.cursor = _us()
+            self.active = True
 
     def record(self, name, duration):
         if self.timing and self.active:
             i = INDEX[name]
             self.values[i] += max(0, int(duration))
-            self.seen[i] = True
+            self.seen |= 1 << i
 
     def mark(self, name):
         if self.timing:
             self.record(name, _elapsed(self.cursor))
             self.cursor = _us()
 
-    def add(self, name, value):
-        metric = self.metrics.get(name)
-        if metric is None:
-            metric = self.metrics[name] = Metric()
-        metric.add(value)
+    def native(self, timing):
+        # C phases are disjoint children of vision, not additional loop cost.
+        names = ('native_warp', 'native_klt', 'native_sad', 'native_detect', 'native_fit', 'native_copy')
+        for i in range(6):
+            if timing[i]:
+                self.record(names[i], timing[i])
 
-    def event(self, now, message):
-        self.events += 1
-        if self.log is not None:
-            self.log.event('[%.3fs] %s\n' % ((now-self.start)*1e-6, message))
+    def event(self, now, code, argument=0):
+        if self.events is not None:
+            self.events.add((now-self.start)//1000, code, argument)
+
+    def observe_health(self, now):
+        if not self.timing:
+            return
+        health = int(self.link.connected(now)) | (int(self.link.synced(now)) << 1)
+        if self.health is not None:
+            changed = self.health ^ health
+            if changed & 1:
+                self.event(now, 0, health & 1)
+            if changed & 2:
+                self.event(now, 1, (health >> 1) & 1)
+        self.health = health
+
+    def add_detail(self, i, value):
+        if value is None or not math.isfinite(value):
+            return
+        if not self.detail_counts[i]:
+            self.detail_minimum[i] = self.detail_maximum[i] = value
+        else:
+            self.detail_minimum[i] = min(self.detail_minimum[i], value)
+            self.detail_maximum[i] = max(self.detail_maximum[i], value)
+        self.detail_counts[i] += 1
+        self.detail_sums[i] += value
+
+    def observe(self, result, now):
+        self.observe_health(now)
+        if result is None:
+            self.no_new_loops += 1
+            return False
+        stamp, sequence = result['timestamp_us'], result.get('frame_sequence')
+        if ((self.last_stamp is not None and stamp <= self.last_stamp) or
+                (sequence is not None and self.last_sequence is not None and sequence == self.last_sequence)):
+            self.no_new_loops += 1
+            return False
+        self.last_stamp, self.last_sequence, self.last_result = stamp, sequence, result
+        epoch = result['reset_counter']
+        if self.epoch is not None and epoch != self.epoch:
+            self.reset_events += 1
+            self.origin = None
+            self.pending_origin = False
+            self.event(now, 4, epoch)
+            print('轨迹重置：旧原点已清除，请重新按Enter。')
+        self.epoch = epoch
+        self.frames += 1
+        self.rate_counts[0] += 1
+        valid, reason = result['valid'], result['reason']
+        if valid:
+            self.valid_frames += 1
+            self.sparse_frames += int(result.get('sparse', False))
+            self.rate_counts[1] += 1
+            quality = result.get('quality')
+            if quality is not None and math.isfinite(quality) and 0 <= quality <= 100:
+                self.quality_sum += quality
+                self.quality_count += 1
+            if self.in_loss:
+                self.event(now, 3, (now-self.loss_start)//1000)
+                self.in_loss = False
+            self.had_tracking = True
+        else:
+            if self.had_tracking and not self.in_loss:
+                self.in_loss, self.loss_start = True, now
+                self.lost_episodes += 1
+                self.event(now, 2, FAILURE_INDEX.get(reason, len(FAILURES)-1))
+            if reason in INITIAL_STATES:
+                self.initial_frames += 1
+            elif reason in RECOVERY_STATES:
+                self.recovery_frames += 1
+            else:
+                i = FAILURE_INDEX.get(reason, len(FAILURES)-1)
+                self.failure_counts[i] += 1
+                if self.in_loss:
+                    self.loss_counts[i] += 1
+                if self.timing and FAILURES[i][2] == 1 and reason.startswith('RANGE_') and i != self.last_range_failure:
+                    self.event(now, 5, i)
+                self.last_range_failure = i
+        if valid:
+            self.last_range_failure = None
+        mask = publication_block_mask(result, self.link, now)
+        if self.gate.accept(result, now, mask):
+            self.publish_frames += 1
+            self.rate_counts[2] += 1
+        if self.timing:
+            for i in range(len(BLOCK_CODES)):
+                if mask & (1 << i):
+                    self.block_counts[i] += 1
+            if result.get('vision') is not None:
+                self.add_detail(0, result.get('matches'))
+                self.add_detail(1, result.get('inliers'))
+                self.add_detail(2, result.get('residual_px'))
+        return True
 
     def update_rates(self, now):
         elapsed = now-self.rate_start
         if elapsed >= RATE_WINDOW_US:
-            self.rates = tuple(count*1000000.0/elapsed for count in self.rate_counts)
-            self.rate_ready = True
-            self.rate_counts = [0, 0, 0]
-            self.rate_start = now
+            self.rates[0] = self.rate_counts[0]*1000000.0/elapsed
+            self.rates[1] = self.rate_counts[2]*1000000.0/elapsed
+            self.rates[2] = 100.0*self.rate_counts[1]/max(1, self.rate_counts[0])
+            self.rate_counts[0] = self.rate_counts[1] = self.rate_counts[2] = 0
+            self.rate_start, self.rate_ready = now, True
 
-    def relative(self, result):
-        if self.origin is None or result is None or not result['valid']:
+    def fresh(self, result, now):
+        return result is not None and 0 <= now-result['timestamp_us'] <= C.MAX_TX_AGE_US
+
+    def relative(self, result, now):
+        if self.origin is None or not self.fresh(result, now) or not result['valid']:
             return None
-        return tuple(result['position'][i]-self.origin[i] for i in range(2))
+        return result['position'][0]-self.origin[0], result['position'][1]-self.origin[1]
 
-    def end_segment(self, now, why):
-        segment = self.segment
-        if segment is None:
-            return
-        if self.log is not None:
-            self.log.flush()
-            self.log.write('\n初始点区间%d | 开始=%.3fs 时长=%.3fs 结束原因=%s\n' % (
-                segment['id'], (segment['start']-self.start)*1e-6,
-                (now-segment['start'])*1e-6, why))
-            self.log.write('帧数=%d 有效=%d 有效率=%.2f%% 最后有效ΔN/ΔE=%r 最终位置有效=%s\n' % (
-                segment['frames'], segment['valid'], 100.0*segment['valid']/max(1, segment['frames']),
-                segment['last'], segment['current_valid']))
-            self.log.write('内部参考原点N/E=%r 所属轨迹reset_counter=%d；方向为飞控NED轴。\n' % (
-                segment['origin'], segment['epoch']))
-            for name in ('N', 'E'):
-                self.log.write('Δ%s(m) | %s\n' % (name, segment[name].text()))
-            self.log.flush()
-        self.segment = None
-
-    def set_origin(self, result, now):
-        self.end_segment(now, 'Enter更新初始点')
-        self.origin = tuple(result['position'])
-        self.origin_id += 1
-        self.pending_origin = False
-        self.rate_start, self.rate_counts = now, [0, 0, 0]
-        self.rates = (0.0, 0.0, 0.0)
-        self.rate_ready = False
-        self.segment = dict(id=self.origin_id, start=now, frames=0, valid=0,
-                            origin=self.origin, epoch=result['reset_counter'],
-                            last=None, current_valid=True, N=Metric(), E=Metric())
-        self.event(now, '已建立初始点%d；ΔN/ΔE归零，保留视觉跟踪' % self.origin_id)
-        print('已建立初始点%d，ΔN=0 ΔE=0；帧率窗口重新统计。' % self.origin_id)
-
-    def observe_details(self, result, now):
-        link = self.link
-        if result is not None:
-            vision = result.get('vision') or {}
-            for key in ('height', 'quality', 'residual_px', 'attitude_age_us', 'range_age_us', 'residual_yaw'):
-                self.add(key, result.get(key))
-            self.add('range_skipped_attitude_cumulative_current_epoch', result.get('range_skipped_attitude'))
-            if result['q'] is not None:
-                # 角度有环绕，只记录最终值和范围，报告时不输出普通平均。
-                for name, value in zip(('roll_deg', 'pitch_deg', 'yaw_deg'), euler_degrees(result['q'])):
-                    self.add(name, value)
-            if vision:
-                self.last_vision = vision
-                for key in ('keypoints', 'matches', 'inliers', 'cells', 'spread', 'klt', 'sad', 'search_px'):
-                    self.add('vision_'+key, vision.get(key))
-                if result['matches']:
-                    self.add('inlier_ratio', result['inliers']/result['matches'])
-                if self.seen[INDEX['match']]:
-                    self.orb_attempts += 1
-                self.orb_success += int(bool(vision.get('orb')))
-                increment(self.reasons, 'reference_'+str(vision.get('reference', 'unknown')))
-            variance = result.get('variance')
-            if result['valid'] and variance is not None:
-                self.add('variance_N_m2', variance[0]); self.add('variance_E_m2', variance[1])
-            increment(self.reasons, 'height_'+str(result.get('range_state', 'unknown')))
-            if result.get('range_detail'):
-                increment(self.reasons, 'range_'+result['range_detail'])
-        for name, history in (('attitude', link.attitudes), ('range', link.ranges)):
-            self.add(name+'_receive_age_ms', None if not history else (now-history[-1][-1])*.001)
-        fc_stamp = None if result is None else link.fc_time(result['timestamp_us'])
-        self.add('image_minus_latest_attitude_ms', None if fc_stamp is None or not link.attitudes
-                 else (fc_stamp-link.attitudes[-1][0])*.001)
-        received = getattr(link, 'sync_received', 0)
-        if received != self.last_sync_received:
-            self.add('sync_RTT_ms', None if link.last_sync_rtt_us is None else link.last_sync_rtt_us*.001)
-            self.last_sync_received = received
-        if link.last_ack != self.last_ack:
-            self.event(now, '消息频率请求结果=%r' % (link.last_ack,))
-            self.last_ack = link.last_ack
-        if now-self.last_camera_sample >= 1000000:
-            self.last_camera_sample = now
-            self.add('exposure_us', self.sensor.get_exposure_us())
-            self.add('gain_db', self.sensor.get_gain_db())
-            if link.ranges:
-                sample = link.ranges[-1]
-                self.add('raw_range_m', sample[1])
-                self.add('range_min_m', sample[2]); self.add('range_max_m', sample[3])
-                self.add('range_signal_raw', sample[4])
-                increment(self.reasons, 'raw_range_'+str(range_invalid_detail(*sample[1:5]) or 'OK'))
-            if hasattr(gc, 'mem_free'):
-                self.add('heap_free_bytes', gc.mem_free())
-
-    def observe(self, result, now):
-        self.loops += 1
-        if result is not None:
-            self.last_result = result
-            epoch = result['reset_counter']
-            if self.epoch is not None and epoch != self.epoch:
-                self.reset_events += 1
-                self.end_segment(now, '算法轨迹重置')
-                self.origin = None
-                self.pending_origin = False
-                self.event(now, '算法轨迹重置；旧初始点失效，请重新按Enter')
-                print('算法轨迹重置：旧初始点已清除，请重新按Enter。')
-            self.epoch = epoch
-            self.frames += 1
-            self.valid_frames += int(result['valid'])
-            blockers = publication_blockers(result, self.link, now)
-            published = self.gate.accept(result, now, blockers)
-            self.latest_blockers = blockers
-            self.publish_frames += int(published)
-            for i, value in enumerate((1, int(result['valid']), int(published))):
-                self.rate_counts[i] += value
-            if self.timing:
-                for name in blockers:
-                    increment(self.blockers, name)
-        reason = 'NO_NEW_FRAME' if result is None else result['reason']
-        if self.timing:
-            increment(self.reasons, reason)
-            self.observe_details(result, now)
-        state = (self.link.connected(now), self.link.synced(now), reason,
-                 None if result is None else result.get('range_detail'),
-                 None if result is None else result['approximate'])
-        if state != self.state_key:
-            if self.state_key is not None:
-                self.add_duration(now)
-                for i, name in ((0, '连接'), (1, '同步')):
-                    if state[i] != self.state_key[i]:
-                        increment(self.health_changes, name+('建立' if state[i] else '失效'))
-            if reason in ('LOST', 'NO_FEATURES') and (self.state_key is None or self.state_key[2] not in ('LOST', 'NO_FEATURES')):
-                self.lost_episodes += 1
-            self.state_key, self.last_state_at = state, now
-            self.event(now, '状态：连接=%s 同步=%s %s 原因=%s 近似=%s' % (
-                state[0], state[1], _state(reason), state[3], state[4]))
-            self.pending_display = True
-        self.update_rates(now)
-
-    def add_duration(self, now):
-        if not self.timing or self.state_key is None:
-            return
-        duration = max(0, now-self.last_state_at)
-        increment(self.durations, self.state_key[2], duration)
-        if not self.state_key[0]:
-            increment(self.durations, 'DISCONNECTED', duration)
-        if not self.state_key[1]:
-            increment(self.durations, 'UNSYNCED', duration)
-        self.last_state_at = now
+    def state(self, result, now):
+        if result is None:
+            return 2
+        state = ((3 if result.get('sparse') else 1) if result['valid'] and self.fresh(result, now) else
+                 0 if result['reason'] in WARMUP_STATES else 2)
+        return state | (4 if result['approximate'] else 0)
 
     def summary(self, result, now):
-        fresh = result is not None and 0 <= now-result['timestamp_us'] <= C.MAX_TX_AGE_US
-        valid = fresh and result['valid']
-        reason = '暂无新图像' if result is None else _state(result['reason'])
-        if result is not None and result['approximate']:
-            reason += '（近似）'
-        if result is not None and result.get('range_detail'):
-            reason += '：'+_state(result['range_detail'])
-        if not fresh:
-            reason += '（当前无新鲜观测）'
-        attitude = '--' if not fresh or result['q'] is None else '%+.1f/%+.1f/%+.1f°' % euler_degrees(result['q'])
-        height = '--' if not fresh or result['height'] is None else '%.3fm' % result['height']
-        relative = self.relative(result) if valid else None
+        state = self.state(result, now)
+        label = DISPLAY_STATES[state & 3]+('（近似）' if state & 4 else '')
+        relative = self.relative(result, now)
         position = 'ΔN=-- ΔE=--' if relative is None else 'ΔN=%+.3fm ΔE=%+.3fm' % relative
-        origin = '未建立，按Enter' if self.origin is None else str(self.origin_id)
+        height = None if not self.fresh(result, now) else result['height']
         warming = '（窗口统计中）' if not self.rate_ready else ''
-        print('状态=%s | 初始点=%s | 有效定位=%.2fHz 可发布=%.2fHz%s | 横滚/俯仰/航向=%s | 离地高度=%s | %s' % (
-            reason, origin, self.rates[1], self.rates[2], warming, attitude, height, position))
+        print('状态=%s | %s | 高度=%sm | 处理=%.2fFPS | 可发布=%.2fHz | 有效率=%.1f%%%s' % (
+            label, position, number(height, 3), self.rates[0], self.rates[1], self.rates[2], warming))
         self.last_display, self.pending_display = now, False
 
-    def finish_frame(self, result, fps):
-        now = self.link.clock.now_us()
-        debug_start = _us() if self.timing else None
-        self.observe(result, now)
-        actions = self.console.poll()
-        candidate = (result is not None and result['valid']
-                     and 0 <= now-result['timestamp_us'] <= C.MAX_TX_AGE_US)
-        stop = False
-        query = False
-        for action in actions:
+    def commit_phase(self, i, duration):
+        self.phase_counts[i] += 1
+        self.phase_totals[i] += duration
+        self.phase_maximum[i] = max(self.phase_maximum[i], duration)
+
+    def interact(self, result, now, new):
+        """交互与数据统计分开；交互异常也能完成本帧统计收尾。"""
+        stop = query = False
+        for action in self.console.poll():
             if action == 'exit':
                 stop = True
                 break
             if action == 'origin':
-                self.pending_origin = True
-                query = True
-                if not candidate:
-                    print('已收到Enter：等待下一有效定位帧建立初始点。')
-                    self.event(now, 'Enter请求；等待下一有效定位帧')
+                self.pending_origin = query = True
+                if not new or not result['valid'] or not self.fresh(result, now):
+                    print('已收到Enter：等待下一有效新图像建立原点。')
             elif action == 'query':
                 query = True
-                self.event(now, 'q查询摘要')
-        if self.pending_origin and candidate:
-            self.set_origin(result, now)
+        if self.pending_origin and new and result['valid'] and self.fresh(result, now):
+            self.origin = result['position'][0], result['position'][1]
+            self.origin_id += 1
+            self.pending_origin = False
+            self.rate_counts[0] = self.rate_counts[1] = self.rate_counts[2] = 0
+            self.rate_start, self.rate_ready = now, False
+            self.rates[0] = self.rates[1] = self.rates[2] = 0.0
+            print('初始点%d已建立，ΔN/ΔE归零；视觉跟踪与全程统计保留。' % self.origin_id)
             query = True
-        if self.segment is not None:
-            self.segment['frames'] += int(result is not None)
-            relative = self.relative(result) if candidate else None
-            self.segment['current_valid'] = relative is not None
-            if relative is not None:
-                self.segment['valid'] += 1
-                self.segment['last'] = relative
-                self.segment['N'].add(relative[0]); self.segment['E'].add(relative[1])
+        self.update_rates(now)
+        state = self.state(self.last_result, now)
+        if state != self.display_state:
+            self.display_state, self.pending_display = state, True
         if query or (self.pending_display and now-self.last_display >= EVENT_DISPLAY_INTERVAL_US):
-            self.summary(result, now)
-        if self.timing:
-            self.record('test_output', _elapsed(debug_start))
-            if self.seen[INDEX['vo_total']]:
-                self.record('vo_other', max(0, self.values[INDEX['vo_total']]-sum(self.values[INDEX[n]] for n in VO_PARTS)))
-            self.record('cycle', _elapsed(self.frame_start))
-            self.active = False
-            for i, metric in enumerate(self.phases):
-                if self.seen[i]:
-                    metric.add(self.values[i])
+            self.summary(self.last_result, self.link.clock.now_us())
         return stop
 
-    def report(self, now, reason, error):
-        write = self.log.write
-        seconds = max(0, now-self.start)*1e-6
-        divisor = max(.000001, seconds)
-        write('\n=== 整次测试最终统计 ===\n结束原因=%s\n错误=%s\n运行时长=%.3fs 循环=%d 图像=%d 有效=%d 可发布=%d\n' % (
-            reason, error or '无', seconds, self.loops, self.frames, self.valid_frames, self.publish_frames))
-        write('全程处理/有效定位/可发布=%.3f/%.3f/%.3fHz 有效率=%.2f%%\n' % (
-            self.frames/divisor, self.valid_frames/divisor, self.publish_frames/divisor,
-            100.0*self.valid_frames/max(1, self.frames)))
-        write('结束时最近窗口处理/有效/可发布=%r Hz；不满首个窗口时为0，非全程统计。\n' % (self.rates,))
-        write('可发布为准入+限频干跑，测试ODOMETRY实际发送=0；不代表UART吞吐或飞控融合率。\n')
-        result = self.last_result
-        write('最终观测=%r\n' % (None if result is None else {k: result.get(k) for k in (
-            'timestamp_us', 'reason', 'valid', 'q', 'height', 'quality', 'reset_counter', 'keyframe', 'approximate')},))
-        fresh = result is not None and 0 <= now-result['timestamp_us'] <= C.MAX_TX_AGE_US
-        write('最终观测新鲜=%s；最后有效值与当前有效性分别标记。\n' % fresh)
-        write('最后一次已执行视觉诊断=%r\n' % (self.last_vision,))
-        write('\n数值统计：每帧/执行时采样；曝光、增益、原始ToF、堆每秒采样。\n')
-        for name in sorted(self.metrics):
-            metric = self.metrics[name]
-            if name.endswith('_deg'):
-                write('%s | 样本=%d 最小/最大/最后=%r/%r/%r；角度环绕，不计算普通均值\n' % (
-                    name, metric.count, metric.minimum, metric.maximum, metric.last))
-            else:
-                write('%s | %s\n' % (name, metric.text()))
-        write('\n状态/检查结果出现帧数（子项可重叠，不是测距拒绝包数）\n')
-        for name in sorted(self.reasons):
-            write('%s=%d\n' % (name, self.reasons[name]))
-        write('\n状态持续时间（最后观察状态维持至下一次观察，子项可重叠）\n')
-        for name in sorted(self.durations):
-            write('%s=%.4fs\n' % (name, self.durations[name]*1e-6))
-        write('\n发布受阻帧数（同一帧可能有多个原因）\n')
-        for name in sorted(self.blockers):
-            write('%s=%d\n' % (BLOCK_NAMES.get(name, name), self.blockers[name]))
+    def finish_frame(self, result, fps):
+        debug_start = _us() if self.timing else None
+        now = self.link.clock.now_us()
+        new = self.observe(result, now)
+        try:
+            return self.interact(result, now, new)
+        finally:
+            self.finish_statistics(now, debug_start)
+
+    def finish_statistics(self, now, debug_start):
+        if self.timing:
+            if now-self.last_heap_sample >= 1000000:
+                self.last_heap_sample = now
+                if hasattr(gc, 'mem_free'):
+                    free = gc.mem_free()
+                    self.minimum_heap = free if self.minimum_heap is None else min(self.minimum_heap, free)
+            for i in range(len(PHASES)):
+                if self.seen & (1 << i):
+                    self.commit_phase(i, self.values[i])
+            # 固定表更新也纳入debug/cycle；不再放在完整循环计时之后。
+            self.commit_phase(INDEX['debug'], _elapsed(debug_start))
+            self.commit_phase(INDEX['cycle'], _elapsed(self.frame_start))
+            self.active = False
+        self.end = self.link.clock.now_us()
+
+    def snapshot(self):
+        elapsed = 0 if self.start is None else max(0, self.end-self.start)
+        seconds = elapsed*1e-6
+        return dict(seconds=seconds, frames=self.frames, stable=self.valid_frames,
+            publishable=self.publish_frames, fps=None if not seconds else self.frames/seconds,
+            publish_hz=None if not seconds else self.publish_frames/seconds,
+            quality=None if not self.quality_count else self.quality_sum/self.quality_count,
+            valid_ratio=None if not self.frames else 100.0*self.valid_frames/self.frames)
+
+    def common_lines(self, snapshot, reason, error):
+        yield '结束原因=%s | 测量时长=%.3fs\n' % (reason, snapshot['seconds'])
+        yield '总接收图像=%d | 稳定追踪帧=%d | 可发布帧=%d\n' % (
+            snapshot['frames'], snapshot['stable'], snapshot['publishable'])
+        confidence = '无有效样本' if snapshot['quality'] is None else number(snapshot['quality'])+'/100'
+        yield '平均处理=%sFPS | 平均可发布=%sHz | 平均置信度=%s | 有效率=%s%%\n' % (
+            number(snapshot['fps']), number(snapshot['publish_hz']),
+            confidence, number(snapshot['valid_ratio']))
+        yield '失跟段=%d | 轨迹重置=%d | 初始化帧=%d | 恢复确认帧=%d\n' % (
+            self.lost_episodes, self.reset_events, self.initial_frames, self.recovery_frames)
+        if not self.frames and self.no_new_loops:
+            yield '未获得可统计的新图像；无新图像/重复循环=%d。\n' % self.no_new_loops
+        counts = self.loss_counts if self.lost_episodes else self.failure_counts
+        total = sum(counts)
+        if self.lost_episodes:
+            yield '主要失跟原因（仅已建立追踪之后；比例分母为已分类原因帧）\n'
+        elif not self.had_tracking:
+            yield '尚未建立稳定追踪；首次定位受阻原因（初始化/恢复确认单列）\n'
+        else:
+            yield '本次未发生失跟；启动及其他输入受阻原因\n'
+        ranked = sorted(range(len(FAILURES)), key=lambda i: counts[i], reverse=True)
+        emitted = 0
+        for i in ranked:
+            if counts[i] and emitted < 3:
+                group = ('视觉/运行限制', '输入不可用', '其他')[FAILURES[i][2]]
+                yield '%s：%s=%d帧（%.1f%%）\n' % (group, FAILURES[i][1], counts[i], 100.0*counts[i]/total)
+                emitted += 1
+        if not total:
+            yield '无已分类失效原因。\n'
+        yield '置信度沿用算法0~100评分；可发布为准入+限频模拟，ODOMETRY实际发送=0。\n'
+        if error:
+            yield '异常信息：%s\n' % error
+
+    def report(self, write, snapshot, reason, error):
+        write('MODE2精简定位日志 | 版本=%s\n' % DEBUG_VERSION)
+        for line in self.common_lines(snapshot, reason, error):
+            write(line)
+        seconds = snapshot['seconds']
+        write('有效定位=%.3fHz（仅MODE2）；无新图像/重复循环=%d\n' % (
+            self.valid_frames/seconds if seconds else 0.0, self.no_new_loops))
+        write('关键启动配置：宽/高/特征上限/FAST/KLT迭代/曝光/增益/发布质量/发布限频/时序确认/方向确认=%r\n' % (self.start_config,))
+        write('\n视觉可靠性：样本数；最低/平均/最大\n')
+        for i, name in enumerate(DETAIL_NAMES):
+            count = self.detail_counts[i]
+            write('%s | %s\n' % (name, '未执行' if not count else '%d；%.3f/%.3f/%.3f' % (
+                count, self.detail_minimum[i], self.detail_sums[i]/count, self.detail_maximum[i])))
+        write('少点有效跟踪=%d帧；纯FAST/KLT，无ORB恢复\n' % self.sparse_frames)
+        write('\n全程失效帧（初始化/恢复确认单列；与失跟段数不同）\n')
+        for i, (_, label, _) in enumerate(FAILURES):
+            if self.failure_counts[i]:
+                write('%s=%d帧\n' % (label, self.failure_counts[i]))
+        write('\n发布受阻帧（同一帧可有多个原因）\n')
+        for i, label in enumerate(BLOCK_NAMES):
+            if self.block_counts[i]:
+                write('%s=%d帧\n' % (label, self.block_counts[i]))
         link = self.link
-        att_count = getattr(link, 'attitude_received', 0)-self.rx_start[0]
-        range_count = getattr(link, 'range_received', 0)-self.rx_start[1]
-        write('\n输入全程：选定飞控姿态包=%d(%.3fHz) 选定ToF包=%d(%.3fHz)\n' % (
-            att_count, att_count/divisor, range_count, range_count/divisor))
-        write('最终链路：连接=%s 同步=%s 同步计数=%d 同步回复累计=%d RTT拒绝累计=%d CRC错误累计=%d 发送丢弃累计=%d\n' % (
-            link.connected(now), link.synced(now), link.sync_count, getattr(link, 'sync_received', 0),
-            link.sync_rtt_rejected, link.parser.bad_crc, link.tx_dropped))
-        write('最终ToF_ID=%r 请求结果=%r 飞控重启累计=%d 时钟域重置累计=%d\n' % (
-            link.range_id, link.last_ack, link.boot_generation, link.time_generation))
-        write('连接/同步状态转换次数=%r（首次观察不计为转换）\n' % self.health_changes)
-        write('状态变化/操作事件=%d 失跟段=%d 观察到轨迹重置=%d ORB尝试/成功=%d/%d\n' % (
-            self.events, self.lost_episodes, self.reset_events, self.orb_attempts, self.orb_success))
-        write('\n阶段耗时：次数；最小/平均/最大/最后(ms)；累计(ms)；占循环比例\n')
-        cycle_total = self.phases[INDEX['cycle']].total
-        for i, (name, label) in enumerate(PHASES):
-            metric = self.phases[i]
-            write('%s | %s | 累计=%.3fms 占循环=%.2f%%\n' % (
-                label, metric.text(.001), metric.total*.001, 100.0*metric.total/max(1, cycle_total)))
-        write('VO总处理包含视觉子项；维护包含GC，父子项不能相加。采图含等待，不等于CPU占用。\n')
-        write('统计管理及未分项间隙=%.3fms；异常中断的未完成循环不纳入完整循环表。\n' % max(0, (now-self.start-cycle_total)*.001))
-        write('\n=== 本次测试分析 ===\n')
-        write('有效定位=%d/%d(%.2f%%)，可发布=%d。\n' % (
-            self.valid_frames, self.frames, 100.0*self.valid_frames/max(1, self.frames), self.publish_frames))
-        ranked = sorted(((self.phases[INDEX[n]].total, n) for n in (
-            'poll_before', 'capture', 'poll_after', 'wait_attitude', 'camera', 'features', 'match',
-            'track_fit', 'vision_poll', 'image_stats', 'vo_other', 'housekeeping', 'output', 'test_output')), reverse=True)
-        ranked = [(total, name) for total, name in ranked if total > 0]
-        if not ranked:
-            write('没有可比较的完整阶段耗时，无法判断主要耗时项。\n')
-        for total, name in ranked[:3]:
-            write('耗时项：%s=%.2f%%完整循环\n' % (PHASES[INDEX[name]][1].strip(), 100.0*total/max(1, cycle_total)))
-        if self.blockers:
-            for name, count in sorted(self.blockers.items(), key=lambda item: item[1], reverse=True)[:3]:
-                write('主要发布限制：%s，占图像帧%.2f%%。\n' % (BLOCK_NAMES.get(name, name), 100.0*count/max(1, self.frames)))
-        write('输入平均接收/请求目标：姿态%.2f/%.2fHz，ToF %.2f/%.2fHz；平均值含启动和断流时段。\n' % (
-            att_count/divisor, C.ATTITUDE_HZ, range_count/divisor, C.RANGE_HZ))
-        write('输入异常依据：断连%.3fs 未同步%.3fs CRC错误%d RTT拒绝%d。\n' % (
-            self.durations.get('DISCONNECTED', 0)*1e-6, self.durations.get('UNSYNCED', 0)*1e-6,
-            link.parser.bad_crc, link.sync_rtt_rejected))
-        write('恢复情况：失跟段%d ORB尝试/成功%d/%d 轨迹重置%d。\n' % (
-            self.lost_episodes, self.orb_attempts, self.orb_success, self.reset_events))
-        if not self.valid_frames:
-            write('无有效定位，不能据此代表正常跟踪负载；先排查输入和视觉状态。\n')
-        if not self.origin_id:
-            write('未按Enter成功建立初始点，本次没有相对位置区间。\n')
-        write('未记录图像或无限逐帧序列；最后统计覆盖本次全程，区间结束即写入以限制内存。\n')
-        write('RTT为帧循环观察到的新同步回复样本；同一循环多个回复只保留最后一个RTT。\n')
-        write('打印、事件写盘和计时会影响实测帧率；最终报告写盘发生在测量结束后。\n日志完成\n')
+        att = getattr(link, 'attitude_received', 0)-self.rx_start[0]
+        ran = getattr(link, 'range_received', 0)-self.rx_start[1]
+        write('\n输入：姿态=%d包/%.2fHz ToF=%d包/%.2fHz CRC错误=%d RTT拒绝=%d\n' % (
+            att, att/seconds if seconds else 0, ran, ran/seconds if seconds else 0,
+            link.parser.bad_crc-self.rx_start[2], link.sync_rtt_rejected-self.rx_start[3]))
+        write('最低可用堆=%s（每秒采样，不代表瞬时分配峰值）\n' % (
+            '未提供' if self.minimum_heap is None else '%d字节' % self.minimum_heap))
+        write('\n阶段：次数；平均/最大ms；累计ms；占完整循环比例\n')
+        cycle = self.phase_totals[INDEX['cycle']]
+        for i, (_, label) in enumerate(PHASES):
+            count = self.phase_counts[i]
+            if count:
+                total = self.phase_totals[i]
+                write('%s | %d；%.3f/%.3f；%.3f；%.2f%%\n' % (
+                    label, count, total/count*.001, self.phase_maximum[i]*.001, total*.001, 100.0*total/max(1, cycle)))
+            else:
+                write('%s | 未执行\n' % label)
+        write('原生六阶段属于视觉子项，不重复计入完整循环；GC只统计显式调用。采图含等待。未完成的中断循环不纳入阶段表。\n')
+        write('\n重要事件：总数=%d 保留=%d 被覆盖记录=%d；重复事件合并\n' % (
+            self.events.total, self.events.count, self.events.overwritten))
+        for line in self.events.lines():
+            write(line)
+        write('最终报告保存发生在测量结束后；运行中无文件写入。日志完成\n')
 
     def close(self, reason='x正常结束', error=None):
         if self.closed:
             return
-        self.closed = True
-        if self.link is None:
-            # 相机/固件初始化失败也尽量留下原因，不伪造运行统计。
-            if self.timing:
-                self.log = self.log or SessionLog(self.log_directory if self.log_directory is not None else LOG_DIRECTORY)
-                self.log.write('初始化失败：%s %s\n日志完成（未进入测试循环）\n' % (reason, error or ''))
-                self.log.close()
-                print('初始化日志=%s | 保存错误=%s' % (self.log.path, self.log.error or '无'))
+        self.closed, self.active = True, False
+        # 最终写盘及异常中断的半个循环不进入测量分母。
+        snapshot = self.snapshot()
+        if error and self.start is not None:
+            self.event(self.end, 6)
+        for line in self.common_lines(snapshot, reason, error):
+            print(line, end='')
+        if not self.timing:
             return
-        now = self.link.clock.now_us()
-        self.add_duration(now)
-        if self.segment is not None and (self.last_result is None or now-self.last_result['timestamp_us'] > C.MAX_TX_AGE_US):
-            self.segment['current_valid'] = False
-        self.end_segment(now, reason)
-        if self.timing:
-            self.log = self.log or SessionLog(self.log_directory if self.log_directory is not None else LOG_DIRECTORY)
-            self.log.flush()
-            self.report(now, reason, error)
-            self.log.close()
-            if self.log.error:
-                print('日志保存失败/不完整：%s | %s' % (self.log.path, self.log.error))
+        try:
+            self.log = SessionLog(self.log_directory if self.log_directory is not None else LOG_DIRECTORY)
+            if self.start is None:
+                self.log.write('MODE2未进入测试循环 | 版本=%s\n' % DEBUG_VERSION)
+                for line in self.common_lines(snapshot, reason, error):
+                    self.log.write(line)
+                self.log.write('日志完成\n')
             else:
-                print('测试结束，完整日志=%s' % self.log.path)
-        else:
-            print('测试结束：%s；MODE1不生成详细日志。' % reason)
+                self.report(self.log.write, snapshot, reason, error)
+        except Exception as save_error:
+            if self.log is not None:
+                self.log.error = repr(save_error)
+            print('日志保存失败：%r' % save_error)
+        finally:
+            if self.log is not None:
+                self.log.close()
+                print('日志=%s | 保存状态=%s' % (self.log.path, self.log.error or '完成'))
 
 
 def main():
@@ -634,11 +629,10 @@ def main():
         reason, error = '程序异常', exception_text(exception)
         raise
     finally:
-        # 保存失败不能掩盖原始异常，也不向飞控发送测试观测。
         try:
             session.close(reason, error)
         except BaseException as save_error:
-            print('最终日志保存失败：%r；结束原因=%s 原始错误=%s' % (save_error, reason, error))
+            print('总结保存失败：%r；结束原因=%s 原始错误=%s' % (save_error, reason, error))
 
 
 if __name__ == '__main__':

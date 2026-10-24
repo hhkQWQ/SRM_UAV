@@ -27,15 +27,18 @@ def prepare(root):
         raise ValueError('Unsupported OpenMV STM32 link layout')
     destination = root/'src'/'omv'/'rm_vo'
     # Resolve every write target before copying, including existing symlinks.
-    targets = [destination/name for name in ('modvo.c','vo_core.c','vo_core.h','micropython.mk')]
+    targets = [destination/name for name in ('modvo.c','vo_core.c','vo_core.h','vo_fast.c','vo_fast.h','micropython.mk')]
     for target in targets+[portconfig]:
         if not target.resolve().is_relative_to(PROJECT):
             raise ValueError('Write target escapes project: '+str(target))
-    if MARKER not in port:
-        snippet = (MARKER+'\n'
-            'FIRM_OBJ += $(BUILD)/$(MICROPY_DIR)/rm_vo/modvo.o\n'
-            'FIRM_OBJ += $(BUILD)/$(MICROPY_DIR)/rm_vo/vo_core.o\n\n')
-        port = port.replace(anchor,snippet+anchor,1)
+    # Replace our own block on upgrades as well as first install.
+    if MARKER in port:
+        begin=port.index(MARKER)
+        end=port.index('\n\n',begin)+2
+        port=port[:begin]+port[end:]
+    snippet=(MARKER+'\n'+''.join('FIRM_OBJ += $(BUILD)/$(MICROPY_DIR)/rm_vo/'+name+'.o\n'
+                                 for name in ('modvo','vo_core','vo_fast'))+'\n')
+    port=port.replace(anchor,snippet+anchor,1)
     destination.mkdir(parents=True,exist_ok=True)
     for target in targets:
         shutil.copyfile(NATIVE/target.name,target)

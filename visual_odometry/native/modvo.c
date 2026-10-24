@@ -1,6 +1,6 @@
 /* MicroPython binding: generic buffer protocol, no OpenMV private headers. */
 #include "py/runtime.h"
-#include "py/obj.h"
+#include "py/mphal.h"
 #include "vo_core.h"
 #include <string.h>
 
@@ -45,24 +45,25 @@ static mp_obj_t step(size_t n_args,const mp_obj_t *args) {
     memcpy(out,self->core.output,VO_RESULT_FLOATS*sizeof(float));return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(step_obj,6,6,step);
-static mp_obj_t recover(size_t n_args,const mp_obj_t *args) {
-    (void)n_args;
-    vo_obj_t *self=MP_OBJ_TO_PTR(args[0]);
-    const uint8_t *image=buffer(args[1],VO_PIXELS,MP_BUFFER_READ,0);
-    const float *meta=buffer(args[2],VO_META_FLOATS*sizeof(float),MP_BUFFER_READ,1);
-    int64_t stamp=timestamp(args[3]);
-    mp_buffer_info_t pairs;mp_get_buffer_raise(args[4],&pairs,MP_BUFFER_READ);
-    if(pairs.typecode!='f' || pairs.len%(4*sizeof(float)))
-        mp_raise_ValueError(MP_ERROR_TEXT("ORB pairs must be au,av,bu,bv float32"));
-    float *out=buffer(args[5],VO_RESULT_FLOATS*sizeof(float),MP_BUFFER_WRITE,1);
-    vo_recover(&self->core,image,VO_WIDTH,meta,stamp,pairs.buf,pairs.len/(4*sizeof(float)));
-    memcpy(out,self->core.output,VO_RESULT_FLOATS*sizeof(float));return mp_const_none;
+static uint32_t profile_clock(void) { return (uint32_t)mp_hal_ticks_us(); }
+static mp_obj_t profile(mp_obj_t self_in,mp_obj_t enabled) {
+    vo_profile(&((vo_obj_t *)MP_OBJ_TO_PTR(self_in))->core,
+               mp_obj_is_true(enabled)?profile_clock:NULL);return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(recover_obj,6,6,recover);
+static MP_DEFINE_CONST_FUN_OBJ_2(profile_obj,profile);
+static mp_obj_t timings(mp_obj_t self_in,mp_obj_t output) {
+    mp_buffer_info_t info;mp_get_buffer_raise(output,&info,MP_BUFFER_WRITE);
+    if(info.typecode!='I' || info.len!=VO_PHASES*sizeof(uint32_t))
+        mp_raise_ValueError(MP_ERROR_TEXT("timings requires six uint32 words"));
+    memcpy(info.buf,((vo_obj_t *)MP_OBJ_TO_PTR(self_in))->core.timing,info.len);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(timings_obj,timings);
 static const mp_rom_map_elem_t locals_table[]={
     {MP_ROM_QSTR(MP_QSTR_reset),MP_ROM_PTR(&reset_obj)},
     {MP_ROM_QSTR(MP_QSTR_step),MP_ROM_PTR(&step_obj)},
-    {MP_ROM_QSTR(MP_QSTR_recover),MP_ROM_PTR(&recover_obj)},
+    {MP_ROM_QSTR(MP_QSTR_profile),MP_ROM_PTR(&profile_obj)},
+    {MP_ROM_QSTR(MP_QSTR_timings),MP_ROM_PTR(&timings_obj)},
 };
 static MP_DEFINE_CONST_DICT(locals_dict,locals_table);
 static MP_DEFINE_CONST_OBJ_TYPE(vo_type,MP_QSTR_Core,MP_TYPE_FLAG_NONE,
@@ -70,7 +71,7 @@ static MP_DEFINE_CONST_OBJ_TYPE(vo_type,MP_QSTR_Core,MP_TYPE_FLAG_NONE,
 static const mp_rom_map_elem_t globals_table[]={
     {MP_ROM_QSTR(MP_QSTR___name__),MP_ROM_QSTR(MP_QSTR_rm_vo)},
     {MP_ROM_QSTR(MP_QSTR_Core),MP_ROM_PTR(&vo_type)},
-    {MP_ROM_QSTR(MP_QSTR_ABI_VERSION),MP_ROM_INT(1)},
+    {MP_ROM_QSTR(MP_QSTR_ABI_VERSION),MP_ROM_INT(VO_ABI_VERSION)},
     {MP_ROM_QSTR(MP_QSTR_CONTEXT_BYTES),MP_ROM_INT(sizeof(vo_context_t))},
 };
 static MP_DEFINE_CONST_DICT(globals_dict,globals_table);

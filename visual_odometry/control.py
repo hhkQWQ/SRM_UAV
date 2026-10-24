@@ -188,7 +188,7 @@ class VOController:
                   "body_valid": False, "reason": reason, "approximate": approximate,
                   "reset_counter": self.reset_counter, "variance": (1.0, 1.0),
                   "keyframe": self.keyframe_id, "matches": 0, "inliers": 0,
-                  "residual_px": None}
+                  "residual_px": None, "sparse": False}
         result["range_detail"] = self.height.reject_detail
         result["range_state"] = self.height.reason
         result["range_skipped_attitude"] = self.height.skipped_attitude
@@ -271,18 +271,13 @@ class VOController:
                 result["height"] = None
                 return result
         if C.MIN_IMAGE_STDEV is not None and statistics is None:
-            probe = getattr(self.engine, "probe", None)
-            if probe is not None:
-                stats_start = A._us()
             statistics = image.get_statistics()
-            if probe is not None:
-                probe.record("image_stats", A._elapsed(stats_start))
         if C.MIN_IMAGE_STDEV is not None and statistics.stdev() < C.MIN_IMAGE_STDEV:
             self.good_frames = 0
             result["reason"] = "LOW_TEXTURE"
             return result
         motion = self.engine.process(image, q, hc, camera_pos, stamp)
-        result["vision"] = getattr(self.engine, "diagnostics", {})
+        result["vision"] = getattr(self.engine, "diagnostics", None)
         result["matches"] = motion["matches"]
         result["inliers"] = motion["inliers"]
         result["keyframe"] = self.keyframe_id = motion["keyframe"]
@@ -293,7 +288,10 @@ class VOController:
             return result
         if motion["status"] != 2:
             self.good_frames = 0
-            result["reason"] = "NO_FEATURES" if motion["status"] == -1 else "LOST"
+            detail = (result["vision"] or {}).get("vision_reason")
+            result["reason"] = ("NO_FEATURES" if motion["status"] == -1 else detail
+                                if detail in ("MATCH_COUNT", "INLIER_RATIO", "AMBIGUOUS_MATCH",
+                                              "PATCH_UNRELIABLE", "INPUT_INVALID") else "LOST")
             if self.lost_since is None:
                 self.lost_since = stamp
             elif stamp-self.lost_since >= C.LOST_RESET_US:
@@ -312,16 +310,30 @@ class VOController:
         rotation_sigma = C.ATTITUDE_STD_RAD+speed*(attitude_age+C.SYNC_MAX_JITTER_US)*1e-6
         reference_height = motion["reference_height"]
         sigma_common2 = ((max(hc, reference_height)*rotation_sigma)**2
-                         +(max(hc, reference_height)*getattr(self.engine, "pixel_sigma", C.PIXEL_STD)/min(C.FX, C.FY))**2
                          +(distance*height_sample[1]/max(hc, 0.1))**2
                          +C.POSITION_NOISE_FLOOR_M**2)
+        # A tiny consensus residual does not prove precise tracking. Independent
+        # pixel noise has a floor; shared pose/range/time errors are not divided
+        # by feature count. Sparse observations receive extra conservatism.
+        pixel_var = (max(hc, reference_height)*getattr(self.engine, "pixel_sigma", C.PIXEL_STD)/min(C.FX, C.FY))**2
+        effective = max(0.5, motion.get("effective_count", count))
+        inflation = (C.TWO_POINT_VARIANCE_FACTOR if count == 2 else
+                     C.THREE_POINT_VARIANCE_FACTOR if count == 3 else 1.0)
         variance = tuple(motion["base_variance"][i]+sigma_common2
-                         +motion["sample_variance"][i]/count for i in range(2))
+                         +inflation*max(pixel_var, motion["sample_variance"][i])/effective
+                         for i in range(2))
         freshness = max(0.1, 1.0-0.5*height_sample[2]/C.MAX_RANGE_AGE_US)
         geometric = min(1.0, count/30.0)*motion["ratio"]
         geometric *= max(0.1, 1.0-0.5*motion["residual_px"]/C.RANSAC_THRESHOLD_PX)
-        geometric *= min(1.0, motion["cells"]/6.0)*min(1.0, motion["spread"]/.1)
+        geometric *= (.3+.7*min(1.0, motion["cells"]/6.0))
+        geometric *= (.3+.7*min(1.0, motion["spread"]/.12))
+        geometric *= min(1.0, effective/count)
         quality = max(1, min(100, int(100*geometric*freshness)))
+        sparse = count <= C.SPARSE_MAX_INLIERS
+        if count == 2:
+            quality = min(quality, C.TWO_POINT_QUALITY_CAP)
+        elif count == 3:
+            quality = min(quality, C.THREE_POINT_QUALITY_CAP)
         if approximate:
             quality = min(quality, C.APPROXIMATE_QUALITY_CAP)
             variance = tuple(v+0.1**2 for v in variance)
@@ -329,7 +341,8 @@ class VOController:
         self.good_frames += 1
         result.update(position=position, variance=variance, matches=motion["matches"],
                       inliers=count, residual_px=motion["residual_px"], quality=quality,
-                      reason="TRACKING", attitude_age_us=attitude_age,
+                      reason="SPARSE_TRACKING" if sparse else "TRACKING", sparse=sparse,
+                      attitude_age_us=attitude_age,
                       range_age_us=height_sample[2], residual_yaw=motion["residual_yaw"])
         if self.good_frames < C.POSE_RECOVERY_FRAMES:
             result.update(position=None, quality=0, reason="POSE_RECOVERING")

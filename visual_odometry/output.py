@@ -4,7 +4,7 @@ from algorithm import euler_degrees
 
 
 _STATES = {
-    "TRACKING": "跟踪正常", "INITIALIZING": "建立参考图",
+    "TRACKING": "跟踪正常", "SPARSE_TRACKING": "少点跟踪", "INITIALIZING": "建立参考图",
     "REINITIALIZING": "轨迹重置，下帧重建原点", "POSE_RECOVERING": "确认跟踪稳定",
     "WAIT_HEARTBEAT": "等待飞控连接", "TIME_UNSYNCED": "等待时钟同步",
     "WAIT_ATTITUDE": "等待图像时刻的姿态", "EXTRINSICS_PENDING": "等待安装参数",
@@ -20,7 +20,8 @@ _STATES = {
     "INLIER_RATIO": "可靠匹配比例低", "COVERAGE": "匹配覆盖范围不足",
     "NOT_FINITE": "距离非数值", "LIMITS_INVALID": "量程无效",
     "SIGNAL_INVALID": "传感器报告无效", "TOO_NEAR": "距离过近", "TOO_FAR": "距离过远",
-    "OK": "可用", "READY": "特征就绪",
+    "AMBIGUOUS_MATCH": "匹配有歧义", "PATCH_UNRELIABLE": "窗口纹理或跟踪不可靠",
+    "INPUT_INVALID": "视觉输入无效", "OK": "可用", "READY": "特征就绪", "TRACK_FAILED": "视觉跟踪失败，原因未细分",
 }
 
 
@@ -28,15 +29,34 @@ def _state(code):
     return _STATES.get(code, code)
 
 
+BLOCK_CODES = ("TIMING_UNCONFIRMED", "POSITION_INVALID", "EXTRINSICS_UNCONFIRMED",
+               "LOW_QUALITY", "DISCONNECTED", "UNSYNCED", "OBSERVATION_STALE")
+
+
+def publication_block_mask(result, link, now):
+    """共用准入位掩码；逐帧不构造检查元组、生成器和原因字符串。"""
+    mask = 0
+    if not C.SENSOR_TIMING_CONFIRMED:
+        mask |= 1
+    if not result["valid"]:
+        mask |= 2
+    if not result["body_valid"]:
+        mask |= 4
+    if not result["quality"] >= C.MIN_PUBLISH_QUALITY:
+        mask |= 8
+    if not link.connected(now):
+        mask |= 16
+    if not link.synced(now):
+        mask |= 32
+    if not 0 <= now-result["timestamp_us"] <= C.MAX_TX_AGE_US:
+        mask |= 64
+    return mask
+
+
 def publication_blockers(result, link, now):
-    """真实发布和测试干跑共用；不含SEND_ODOMETRY或测试发布开关。"""
-    checks = (("TIMING_UNCONFIRMED", C.SENSOR_TIMING_CONFIRMED),
-              ("POSITION_INVALID", result["valid"]),
-              ("EXTRINSICS_UNCONFIRMED", result["body_valid"]),
-              ("LOW_QUALITY", result["quality"] >= C.MIN_PUBLISH_QUALITY),
-              ("DISCONNECTED", link.connected(now)), ("UNSYNCED", link.synced(now)),
-              ("OBSERVATION_STALE", 0 <= now-result["timestamp_us"] <= C.MAX_TX_AGE_US))
-    return tuple(name for name, ok in checks if not ok)
+    """保留名称接口供按需诊断使用；正式输出和测试热路径使用位掩码。"""
+    mask = publication_block_mask(result, link, now)
+    return tuple(name for i, name in enumerate(BLOCK_CODES) if mask & (1 << i))
 
 
 class PublicationGate:
@@ -64,10 +84,10 @@ class Output:
     def update(self, result, fps):
         now = self.link.clock.now_us()
         # 发布与失效取消逐帧检查，不能被显示/诊断限频挡住。
-        blockers = ()
+        blockers = 0
         allowed = self.publish and C.SEND_ODOMETRY
         if allowed:
-            blockers = publication_blockers(result, self.link, now)
+            blockers = publication_block_mask(result, self.link, now)
             allowed = not blockers
         if not allowed:
             self.link.cancel_odometry()

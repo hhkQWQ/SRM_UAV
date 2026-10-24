@@ -25,10 +25,14 @@ def validate_config():
         raise ValueError("stream and output frequencies must be positive")
     if not 0 < C.EXPOSURE_MIN_US <= C.EXPOSURE_MAX_US or C.MAX_BLUR_PX <= 0:
         raise ValueError("invalid exposure or blur settings")
-    if C.FEATURE_DETECTOR not in ("auto", "FAST", "AGAST"):
-        raise ValueError("invalid feature detector")
-    if C.MAX_KEYPOINTS < C.MIN_MATCHES or not 1 <= C.MIN_INLIERS <= C.MIN_MATCHES:
+    if C.MAX_KEYPOINTS < C.MIN_MATCHES or not 2 <= C.MIN_INLIERS <= C.MIN_MATCHES:
         raise ValueError("invalid minimum/maximum feature counts")
+    if not 1 <= C.SEARCH_MIN_PX <= C.SEARCH_MAX_PX <= 8:
+        raise ValueError("local search must stay within eight pixels")
+    if (not 1 <= C.FEATURE_TOPUP_CELLS <= 24 or not 0 <= C.FEATURE_TOPUP_POINTS <= 64
+            or not 1 <= C.KEYFRAME_CHECK_INTERVAL <= 1000 or C.SPARSE_MAX_INLIERS != 3 or not .5 < C.MIN_INLIER_RATIO <= 1
+            or not 0 < C.SAD_UNIQUENESS_RATIO < 1):
+        raise ValueError("invalid tracking work budget/consensus")
     r = C.R_BC
     if len(r) != 9:
         raise ValueError("R_BC must contain 9 values")
@@ -119,10 +123,8 @@ class CameraAdapter:
     """低频闭环调节；不依赖OV5640在固定曝光时自动增益是否继续工作。"""
     def __init__(self, sensor, probe=None):
         self.sensor = sensor
-        self.probe = probe
         self.last_us = -10000000
         self.manual = False
-        self.settings = None
 
     def update(self, image, now, gyro=(0.0, 0.0, 0.0), pixel_speed=0.0):
         if not C.CAMERA_AUTO_TUNE or now-self.last_us < 500000:
@@ -146,8 +148,6 @@ class CameraAdapter:
         if not self.manual or abs(gain-old_gain) >= .2:
             self.sensor.set_auto_gain(False, gain_db=gain)
         self.manual = True
-        if self.probe is not None:
-            self.settings = (self.sensor.get_exposure_us(), self.sensor.get_gain_db(), mean)
         return statistics  # 同一帧的纹理检查复用统计，避免再次扫描全图。
 
 
@@ -189,32 +189,32 @@ def run(observer=None):
         if observer is not None:
             observer.begin_frame()
         link.poll(service_sync=True)
-        if observer is not None:
-            observer.mark("poll_before")
+        if probe is not None:
+            probe.mark("communication")
         image, stamp = capture.get()
-        if observer is not None:
-            observer.mark("capture")
+        if probe is not None:
+            probe.mark("capture")
         link.poll(service_sync=True)
-        if observer is not None:
-            observer.mark("poll_after")
         if image is None:
+            if probe is not None:
+                probe.mark("communication")
             if observer is not None and observer.finish_frame(None, fps):
                 break
             continue
         wait_for_attitude(link, stamp)
-        if observer is not None:
-            observer.mark("wait_attitude")
+        if probe is not None:
+            probe.mark("communication")
         process_start = link.clock.now_us()
         gyro = link.attitudes[-1][2] if link.attitudes else (0.0, 0.0, 0.0)
         pixel_speed = controller.engine.predicted_pixel_speed(last_height, stamp)
         statistics = camera_adapter.update(image, process_start, gyro, pixel_speed)
-        if observer is not None:
-            observer.mark("camera")
+        if probe is not None:
+            probe.mark("capture")
         result = controller.process(image, stamp, link, statistics=statistics)
         last_height = result["height"]
         result["frame_sequence"] = capture.last_sequence
-        if observer is not None:
-            observer.mark("vo_total")
+        if probe is not None:
+            probe.mark("vision")
         frames += 1
         now = link.clock.now_us()
         if now-window_start >= 1000000:
@@ -226,11 +226,8 @@ def run(observer=None):
             gc.collect()
             if probe is not None:
                 probe.record("gc", _elapsed(gc_start))
-        if observer is not None:
-            observer.mark("housekeeping")
         output.update(result, fps)
         if observer is not None:
-            observer.mark("output")
             if observer.finish_frame(result, fps):
                 break
 

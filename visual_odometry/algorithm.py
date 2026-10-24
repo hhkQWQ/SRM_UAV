@@ -1,11 +1,13 @@
 """算法接口：姿态辅助函数与原生QVGA视觉核心。
 
-正常跟踪传递紧凑缓冲；ORB只在关键帧建立与恢复时调用。
+固定缓冲传递；纯FAST检测、KLT跟踪和二维平移均在C中完成。
 """
 import math
 import time
 import config as C
 _INF = float("inf")
+_VISION_REASONS = ('OK', 'MATCH_COUNT', 'INLIER_RATIO', 'AMBIGUOUS_MATCH',
+                   'PATCH_UNRELIABLE', 'INPUT_INVALID', 'INITIALIZING')
 
 
 def _us():
@@ -110,14 +112,14 @@ def undistort(u, v):
 
 
 class FeatureEngine:
-    """Native QVGA frontend; Python schedules sensors and ORB recovery."""
+    """Native QVGA frontend; Python schedules sensors and uncertainty."""
     def __init__(self, probe=None):
         from array import array
         try:
             import rm_vo
         except ImportError:
             raise RuntimeError("缺少rm_vo原生模块：请按README编译并安装固件")
-        if rm_vo.ABI_VERSION != 1:
+        if rm_vo.ABI_VERSION != 2:
             raise RuntimeError("rm_vo接口版本不匹配，请更新固件和全部Python文件")
         import image
         self.image_module, self.array = image, array
@@ -125,56 +127,25 @@ class FeatureEngine:
         self.meta = array('f', [0.0]*13)
         self.timestamp = array('I', [0, 0])
         self.prediction = array('f', [0.0]*3)
-        self.raw = array('f', [0.0]*23)
+        self.raw = array('f', [0.0]*31)
+        self.native_timing = array('I', [0]*6)
+        self.profile_enabled = False
         self.probe, self.service = probe, None
         self.pixel_sigma = C.PIXEL_STD
         self.reset()
 
     def reset(self):
         self.core.reset()
-        self.key_descriptor = None
         self.last_position = self.last_stamp = None
         self.velocity = (0.0, 0.0)
         self.velocity_stamp = None
         self.key_variance = self.previous_variance = (0.0, 0.0)
-        self.empty_frames = 0
-        self.diagnostics = {}
-
-    def _record(self, name, start):
-        if self.probe is not None:
-            self.probe.record(name, _elapsed(start))
+        # 两个必要诊断字段跨帧复用；详细数值由控制结果直接提供。
+        self.diagnostics = {'vision_reason': 'INITIALIZING', 'sparse': False}
 
     def _service(self):
         if self.service is not None:
-            start = _us()
             self.service()
-            self._record('vision_poll', start)
-
-    def _descriptor(self, image):
-        detector = C.FEATURE_DETECTOR
-        if detector == 'auto':
-            detector = 'AGAST' if self.empty_frames >= 3 else 'FAST'
-        corner = (self.image_module.CORNER_FAST if detector == 'FAST'
-                  else self.image_module.CORNER_AGAST)
-        threshold = C.KEYPOINT_THRESHOLD
-        start = _us()
-        descriptor = image.find_keypoints(threshold=threshold,
-            normalized=C.KEYPOINT_NORMALIZED, scale_factor=C.KEYPOINT_SCALE_FACTOR,
-            max_keypoints=C.MAX_KEYPOINTS, corner_detector=corner)
-        if (C.FEATURE_DETECTOR == 'auto' and detector == 'FAST'
-                and (descriptor is None or len(descriptor)<C.MIN_MATCHES)):
-            # A keyframe needs usable recovery descriptors now; waiting for
-            # future frames would lose the original reference image.
-            detector = 'AGAST'
-            descriptor = image.find_keypoints(threshold=threshold,
-                normalized=C.KEYPOINT_NORMALIZED, scale_factor=C.KEYPOINT_SCALE_FACTOR,
-                max_keypoints=C.MAX_KEYPOINTS, corner_detector=self.image_module.CORNER_AGAST)
-        self._record('features', start)
-        self.empty_frames = self.empty_frames+1 if descriptor is None or len(descriptor)<C.MIN_MATCHES else 0
-        self.diagnostics.update(detector_name=detector,detector=threshold,
-            normalized=C.KEYPOINT_NORMALIZED,limit=C.MAX_KEYPOINTS)
-        self._service()
-        return descriptor
 
     def process(self, image, q, height, camera_pos, stamp):
         if image.width()!=320 or image.height()!=240 or image.format()!=self.image_module.GRAYSCALE:
@@ -194,50 +165,22 @@ class FeatureEngine:
         position = self.last_position or (0.0,0.0)
         for i in range(2):
             self.prediction[i] = position[i]+velocity[i]*dt
-        uncertainty = .5*C.PREDICTION_ACCEL_M_S2*dt*dt*max(C.FX,C.FY)/max(.05,height)
-        self.prediction[2] = (min(C.SEARCH_MAX_PX,C.SEARCH_MIN_PX+uncertainty)
-                             if predictive else C.SEARCH_MAX_PX)
-        self.diagnostics = dict(keypoints=0,matches=0,inliers=0,work_size=(320,240),
-            limit=C.MAX_KEYPOINTS,normalized=None,detector_name='KLT/SAD',
-            detector=C.FAST_THRESHOLD,vision_reason='MATCH_COUNT')
-        start = _us()
+        self.prediction[2] = C.SEARCH_MIN_PX if predictive else C.SEARCH_MAX_PX
+        profiling = self.probe is not None
+        if profiling != self.profile_enabled:
+            self.core.profile(profiling)
+            self.profile_enabled = profiling
         self.core.step(image,self.meta,self.timestamp,self.prediction,self.raw)
-        self._record('track_fit',start)
+        if profiling:
+            self.core.timings(self.native_timing)
+            self.probe.native(self.native_timing)
         self._service()
-        used_orb = False
-        if int(self.raw[0])==0 and self.key_descriptor is not None:
-            descriptor = self._descriptor(image)
-            if descriptor is not None and len(descriptor)>=C.MIN_MATCHES:
-                start = _us()
-                match = self.image_module.match_descriptor(self.key_descriptor,descriptor,
-                    threshold=C.MATCH_THRESHOLD,filter_outliers=False)
-                packed = self.array('f')
-                used_source,used_target = set(),set()
-                for i,j in match.match():
-                    if i in used_source or j in used_target:
-                        continue
-                    used_source.add(i);used_target.add(j)
-                    a,b = self.key_descriptor[i],descriptor[j]
-                    # MicroPython array.extend requires a buffer, not a tuple.
-                    for value in (a[0],a[1],b[0],b[1]):
-                        packed.append(value)
-                    if len(used_source)>=64:
-                        break
-                self._record('match',start)
-                start = _us()
-                self.core.recover(image,self.meta,self.timestamp,packed,self.raw)
-                self._record('track_fit',start)
-                used_orb = int(self.raw[0])==2
-                self._service()
         raw = self.raw
         status,key_changed,base = int(raw[0]),bool(raw[15]),int(raw[16])
-        self.diagnostics.update(keypoints=int(raw[19]),matches=int(raw[6]),
-            inliers=int(raw[7]),cells=int(raw[9]),spread=raw[10],
-            klt=int(raw[20]),sad=int(raw[21]),orb=used_orb,reference='near' if base else 'key',
-            search_px=self.prediction[2],vision_reason='OK' if status==2 else 'MATCH_COUNT')
+        self.diagnostics['sparse'] = bool(raw[27]) and status==2
+        reason = int(raw[28])
+        self.diagnostics['vision_reason'] = _VISION_REASONS[reason] if 0<=reason<len(_VISION_REASONS) else 'TRACK_FAILED'
         base_variance = self.previous_variance if base else self.key_variance
-        if key_changed:
-            self.key_descriptor = self._descriptor(image)
         if status==2:
             measured = (raw[1],raw[2])
             if self.last_position is not None and 0<dt<=C.PREDICTION_MAX_AGE_US*1e-6:
@@ -248,11 +191,16 @@ class FeatureEngine:
             self.last_position,self.last_stamp = measured,stamp
         elif status==1:
             self.last_position,self.last_stamp = (0.0,0.0),stamp
+        else:
+            # A failed measurement makes the old search velocity unreliable.
+            self.velocity,self.velocity_stamp = (0.0,0.0),None
         return dict(status=status,position=(raw[1],raw[2]),delta=(raw[3],raw[4]),
             residual_yaw=raw[5],matches=int(raw[6]),inliers=int(raw[7]),ratio=raw[8],
             cells=int(raw[9]),spread=raw[10],residual_px=raw[11],
             sample_variance=(raw[12],raw[13]),keyframe=int(raw[14]),key_changed=key_changed,
-            reference_height=raw[17],reference_dt=raw[18],base_variance=base_variance)
+            reference_height=raw[17],reference_dt=raw[18],base_variance=base_variance,
+            effective_count=raw[30],sparse=bool(raw[27]),attempts=int(raw[23]),
+            sad_candidates=int(raw[24]),detect_cells=int(raw[25]),added=int(raw[26]))
 
     def accept_variance(self, motion, variance):
         self.previous_variance = variance
@@ -270,9 +218,10 @@ def native_settings():
     from array import array
     return array('f',(C.FX,C.FY,C.CX,C.CY)+C.DIST_COEFFS+(
         C.MAX_KEYPOINTS,C.FAST_THRESHOLD,C.MIN_MATCHES,C.MIN_INLIERS,
-        C.MIN_INLIER_RATIO,C.MIN_OCCUPIED_CELLS,C.MIN_RAY_DOWN,C.RANSAC_THRESHOLD_PX,
-        C.MAX_RESIDUAL_YAW_RAD,C.SEARCH_MIN_PX,C.SEARCH_MAX_PX,C.KLT_MAX_ITERATIONS,
+        C.MIN_INLIER_RATIO,C.MIN_RAY_DOWN,C.RANSAC_THRESHOLD_PX,
+        C.SEARCH_MIN_PX,C.SEARCH_MAX_PX,C.KLT_MAX_ITERATIONS,
         C.KLT_MAX_ERROR,C.KLT_FB_ERROR_PX,C.KEYFRAME_DISTANCE_HEIGHT_RATIO,
-        C.KEYFRAME_HEIGHT_RATIO,C.KEYFRAME_ROTATION_RAD,C.NEAR_REFERENCE_FLOW_PX,
-        C.FEATURE_TOPUP_RATIO,C.KLT_MIN_EIGENVALUE,C.RANSAC_MAX_ITERATIONS,
-        C.KEYFRAME_REFRESH_INLIER_RATIO))
+        C.KEYFRAME_HEIGHT_RATIO,C.KEYFRAME_ROTATION_RAD,C.FEATURE_TOPUP_RATIO,
+        C.KLT_MIN_EIGENVALUE,C.KEYFRAME_REFRESH_INLIER_RATIO,
+        C.FEATURE_TOPUP_CELLS,C.FEATURE_TOPUP_POINTS,C.KEYFRAME_CHECK_INTERVAL,
+        C.TEMPLATE_WARP_ANGLE_RAD,C.TEMPLATE_WARP_HEIGHT_RATIO,C.SAD_UNIQUENESS_RATIO))
