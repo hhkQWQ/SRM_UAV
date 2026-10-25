@@ -72,6 +72,7 @@ static const mp_rom_map_elem_t globals_table[]={
     {MP_ROM_QSTR(MP_QSTR___name__),MP_ROM_QSTR(MP_QSTR_rm_vo)},
     {MP_ROM_QSTR(MP_QSTR_Core),MP_ROM_PTR(&vo_type)},
     {MP_ROM_QSTR(MP_QSTR_ABI_VERSION),MP_ROM_INT(VO_ABI_VERSION)},
+    {MP_ROM_QSTR(MP_QSTR_RESULT_FLOATS),MP_ROM_INT(VO_RESULT_FLOATS)},
     {MP_ROM_QSTR(MP_QSTR_CONTEXT_BYTES),MP_ROM_INT(sizeof(vo_context_t))},
 };
 static MP_DEFINE_CONST_DICT(globals_dict,globals_table);

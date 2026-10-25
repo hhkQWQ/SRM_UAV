@@ -11,7 +11,7 @@
 #define VO_MAX_FEATURES 64
 #define VO_PATCH 8
 #define VO_TEMPLATE 10
-#define VO_ABI_VERSION 2
+#define VO_ABI_VERSION 3
 #define VO_META_FLOATS 13 /* R_NC[9], camera lever arm in NED[3], camera height */
 enum {
     V_FX, V_FY, V_CX, V_CY, V_K1, V_K2, V_P1, V_P2, V_K3,
@@ -22,15 +22,15 @@ enum {
     V_KEY_INTERVAL, V_WARP_ANGLE, V_WARP_HEIGHT, V_UNIQUENESS, VO_CONFIG_FLOATS
 };
 enum {
-    O_STATUS, O_N, O_E, O_DN, O_DE, O_YAW, O_MATCHES, O_INLIERS,
-    O_RATIO, O_CELLS, O_SPREAD, O_RESIDUAL, O_VAR_N, O_VAR_E,
-    O_KEY_ID, O_KEY_CHANGED, O_BASE, O_REF_HEIGHT, O_REF_DT,
-    O_FEATURES, O_KLT, O_SAD, O_ITERATIONS, O_ATTEMPTS, O_SAD_TESTS,
-    O_DETECT_CELLS, O_ADDED, O_SPARSE, O_REASON, O_WARPS, O_EFFECTIVE,
+    O_STATUS, O_N, O_E, O_DN, O_DE, O_MATCHES, O_INLIERS,
+    O_RATIO, O_CELLS, O_RESIDUAL, O_VAR_N, O_VAR_E,
+    O_KEY_ID, O_KEY_CHANGED, O_BASE, O_REF_HEIGHT,
+    O_SPARSE, O_REASON, O_EFFECTIVE, O_ATTEMPTS, O_SAD_TESTS,
+    O_DETECT_CELLS, O_ADDED,
     VO_RESULT_FLOATS
 };
 enum { T_WARP, T_KLT, T_SAD, T_DETECT, T_FIT, T_COPY, VO_PHASES };
-enum { VO_REASON_OK, VO_REASON_COUNT, VO_REASON_RATIO, VO_REASON_AMBIGUOUS, VO_REASON_PATCH, VO_REASON_INPUT, VO_REASON_INIT };
+enum { VO_REASON_OK, VO_REASON_COUNT, VO_REASON_RATIO, VO_REASON_AMBIGUOUS, VO_REASON_INPUT, VO_REASON_INIT };
 typedef struct { float x, y, score; } vo_point_t;
 typedef struct {
     float meta[VO_META_FLOATS], position[2];
@@ -38,7 +38,10 @@ typedef struct {
     vo_point_t points[VO_MAX_FEATURES];
     int count;
 } vo_frame_t;
-typedef struct { float au, av, bu, bv, ax, ay, bx, by, weight; } vo_pair_t;
+typedef struct {
+    float au, av, bu, bv, ax, ay, bx, by, weight;
+    float inverse[4]; /* Reuse the accepted warp for sparse uniqueness checks. */
+} vo_pair_t;
 typedef struct {
     /* Persistent images and feature data: owned, never camera DMA buffers. */
     uint8_t key_image[VO_PIXELS], previous_image[VO_PIXELS];

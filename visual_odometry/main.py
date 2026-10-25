@@ -1,6 +1,6 @@
 """OpenMV入口。正常运行main.py；事件摘要与全程测试日志运行test.py。
 
-只显示位姿、离地高度、帧率和质量摘要。默认不回传有效ODOMETRY。
+只显示位姿、离地高度、帧率和置信度摘要。默认不回传有效ODOMETRY。
 """
 import gc
 import math
@@ -33,6 +33,11 @@ def validate_config():
             or not 1 <= C.KEYFRAME_CHECK_INTERVAL <= 1000 or C.SPARSE_MAX_INLIERS != 3 or not .5 < C.MIN_INLIER_RATIO <= 1
             or not 0 < C.SAD_UNIQUENESS_RATIO < 1):
         raise ValueError("invalid tracking work budget/consensus")
+    if (not 0 < C.TRACK_HOLD_US < C.LOST_RESET_US or not 2 <= C.PREDICTION_HISTORY_SIZE <= 16
+            or not 1 <= C.CONFIDENCE_FULL_POINTS <= 64 or not 1 <= C.CONFIDENCE_FULL_CELLS <= 9
+            or not math.isfinite(C.CONFIDENCE_SIGMA0_M) or C.CONFIDENCE_SIGMA0_M <= 0
+            or not math.isfinite(C.PREDICTION_VELOCITY_STD_M_S) or C.PREDICTION_VELOCITY_STD_M_S <= 0):
+        raise ValueError("invalid confidence/prediction parameters")
     r = C.R_BC
     if len(r) != 9:
         raise ValueError("R_BC must contain 9 values")
@@ -121,7 +126,7 @@ class Capture:
 
 class CameraAdapter:
     """低频闭环调节；不依赖OV5640在固定曝光时自动增益是否继续工作。"""
-    def __init__(self, sensor, probe=None):
+    def __init__(self, sensor):
         self.sensor = sensor
         self.last_us = -10000000
         self.manual = False
@@ -157,8 +162,9 @@ def wait_for_attitude(link, stamp):
         now = link.clock.now_us()
         if not link.connected(now) or not link.synced(now):
             return
-        if attitude_at(link.attitudes, link.fc_time(stamp)) is not None:
-            return
+        attitude = attitude_at(link.attitudes, link.fc_time(stamp))
+        if attitude is not None:
+            return attitude
         if now-start >= C.ATTITUDE_WAIT_US:
             return
         link.poll()
@@ -179,7 +185,7 @@ def run(observer=None):
     controller.engine.probe = probe
     output = Output(link)
     capture = Capture(sensor, link.clock)
-    camera_adapter = CameraAdapter(sensor, probe)
+    camera_adapter = CameraAdapter(sensor)
     if observer is not None:
         observer.prepare(sensor, link, controller, capture, camera_adapter, output)
     window_start = link.clock.now_us()
@@ -201,7 +207,7 @@ def run(observer=None):
             if observer is not None and observer.finish_frame(None, fps):
                 break
             continue
-        wait_for_attitude(link, stamp)
+        attitude = wait_for_attitude(link, stamp)
         if probe is not None:
             probe.mark("communication")
         process_start = link.clock.now_us()
@@ -210,7 +216,7 @@ def run(observer=None):
         statistics = camera_adapter.update(image, process_start, gyro, pixel_speed)
         if probe is not None:
             probe.mark("capture")
-        result = controller.process(image, stamp, link, statistics=statistics)
+        result = controller.process(image, stamp, link, statistics=statistics, attitude=attitude)
         last_height = result["height"]
         result["frame_sequence"] = capture.last_sequence
         if probe is not None:

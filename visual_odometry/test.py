@@ -1,8 +1,8 @@
 """MODE1轻量观察及总结；MODE2另存精简诊断，测量期间不写文件。"""
 MODE = 1
-DEBUG_VERSION = 'sparse-vo-2'
+DEBUG_VERSION = 'sparse-vo-3'
 RATE_WINDOW_US = 2000000
-EVENT_DISPLAY_INTERVAL_US = 1000000
+EVENT_DISPLAY_INTERVAL_US = 1000000  # 状态变化摘要的最小间隔；不定时刷新，q立即查询
 LOG_DIRECTORY = None
 EVENT_BUFFER_SIZE = 16
 
@@ -11,7 +11,7 @@ import math
 import os
 import sys
 from array import array
-from algorithm import _us, _elapsed
+from algorithm import _us, _elapsed, euler_degrees
 from output import BLOCK_CODES, publication_block_mask, PublicationGate
 from main import run
 import config as C
@@ -24,12 +24,12 @@ PHASES = (('capture', '采图/相机调节'), ('communication', '通信/输入�
           ('native_fit', '  平移拟合'), ('native_copy', '  参考图复制'))
 INDEX = {name: i for i, (name, _) in enumerate(PHASES)}
 DETAIL_NAMES = ('匹配数', '内点数', '像素残差')
-BLOCK_NAMES = ('时序未确认', '位置无效', '外参未确认或机体位置无效', '质量不足',
-               '飞控未连接', '时钟未同步', '观测过期或时间在未来')
+BLOCK_NAMES = ('时序未确认', '位置无效', '外参未确认或机体位置无效', '置信度不足',
+               '飞控未连接', '时钟未同步', '观测过期或时间在未来', '非新视觉测量')
 FAILURES = (
     ('NO_FEATURES', '特征不足', 0), ('LOST', '视觉跟踪失败，原因未细分', 0),
     ('MATCH_COUNT', '可靠匹配不足', 0), ('INLIER_RATIO', '一致匹配比例不足', 0),
-    ('AMBIGUOUS_MATCH', '少点匹配有歧义', 0), ('PATCH_UNRELIABLE', '窗口跟踪不可靠', 0),
+    ('AMBIGUOUS_MATCH', '少点匹配有歧义', 0),
     ('INPUT_INVALID', '视觉输入无效', 1), ('LOW_TEXTURE', '图像纹理不足', 0), ('DYNAMIC_LIMIT', '动态限制', 0),
     ('VIBRATION', '振动超限', 0), ('WAIT_HEARTBEAT', '等待飞控连接', 1),
     ('TIME_UNSYNCED', '时间未同步', 1), ('WAIT_ATTITUDE', '图像时刻缺少姿态', 1),
@@ -43,7 +43,7 @@ FAILURE_INDEX = {item[0]: i for i, item in enumerate(FAILURES)}
 INITIAL_STATES = ('INITIALIZING', 'REINITIALIZING')
 RECOVERY_STATES = ('POSE_RECOVERING', 'RANGE_RECOVERING')
 WARMUP_STATES = INITIAL_STATES+RECOVERY_STATES
-DISPLAY_STATES = ('初始化', '跟踪正常', '位置无效', '少点跟踪')
+DISPLAY_STATES = ('初始化', '跟踪正常', '位置无效', '少点跟踪', '短时预测')
 EVENT_NAMES = ('连接变化', '同步变化', '进入失跟', '恢复跟踪', '轨迹重置', '测距异常', '程序异常')
 
 
@@ -59,20 +59,6 @@ def exception_text(exception):
         return buffer.getvalue()
     except Exception:
         return repr(exception)
-
-
-# 仅供旧原生验证脚本使用；两种测试模式均不实例化该样本数组。
-class Samples:
-    def __init__(self, capacity=256):
-        self.values = array('I', [0]*capacity)
-        self.count = self.total = self.maximum = 0
-
-    def add(self, value):
-        value = max(0, int(value))
-        self.values[self.count % len(self.values)] = value
-        self.count += 1
-        self.total += value
-        self.maximum = max(self.maximum, value)
 
 
 class Console:
@@ -262,6 +248,7 @@ class TestSession:
         self.minimum_heap = None
         self.last_heap_sample = -1000000
         self.sparse_frames = 0
+        self.predicted_frames = 0
 
     def prepare(self, sensor, link, controller, capture, adapter, output):
         self.link = link
@@ -274,7 +261,7 @@ class TestSession:
             self.start_config = (C.IMAGE_WIDTH, C.IMAGE_HEIGHT, C.MAX_KEYPOINTS,
                 C.FAST_THRESHOLD, C.KLT_MAX_ITERATIONS, C.EXPOSURE_US, C.GAIN_DB,
                 C.MIN_PUBLISH_QUALITY, C.ODOMETRY_HZ, C.SENSOR_TIMING_CONFIRMED,
-                C.CAMERA_ORIENTATION_CONFIRMED)
+                C.CAMERA_ORIENTATION_CONFIRMED,C.CONFIDENCE_SIGMA0_M,C.TRACK_HOLD_US,C.LOST_RESET_US)
         print('MODE%d | %s | Enter=更新原点 q=查询 x=结束 | 测试不发送ODOMETRY' % (self.mode, DEBUG_VERSION))
         print('ΔN/ΔE沿飞控NED轴；有效定位时按Enter建立参考。退出时输出总结。')
         if self.timing:
@@ -358,7 +345,9 @@ class TestSession:
         self.frames += 1
         self.rate_counts[0] += 1
         valid, reason = result['valid'], result['reason']
-        if valid:
+        predicted = valid and result.get('predicted', False)
+        measured = valid and result.get('measured', False) and not predicted
+        if measured:
             self.valid_frames += 1
             self.sparse_frames += int(result.get('sparse', False))
             self.rate_counts[1] += 1
@@ -370,6 +359,8 @@ class TestSession:
                 self.event(now, 3, (now-self.loss_start)//1000)
                 self.in_loss = False
             self.had_tracking = True
+        elif predicted:
+            self.predicted_frames += 1
         else:
             if self.had_tracking and not self.in_loss:
                 self.in_loss, self.loss_start = True, now
@@ -380,14 +371,15 @@ class TestSession:
             elif reason in RECOVERY_STATES:
                 self.recovery_frames += 1
             else:
-                i = FAILURE_INDEX.get(reason, len(FAILURES)-1)
+                failure = result.get('failure_reason', reason)
+                i = FAILURE_INDEX.get(failure, len(FAILURES)-1)
                 self.failure_counts[i] += 1
                 if self.in_loss:
                     self.loss_counts[i] += 1
                 if self.timing and FAILURES[i][2] == 1 and reason.startswith('RANGE_') and i != self.last_range_failure:
                     self.event(now, 5, i)
                 self.last_range_failure = i
-        if valid:
+        if measured:
             self.last_range_failure = None
         mask = publication_block_mask(result, self.link, now)
         if self.gate.accept(result, now, mask):
@@ -423,19 +415,28 @@ class TestSession:
     def state(self, result, now):
         if result is None:
             return 2
-        state = ((3 if result.get('sparse') else 1) if result['valid'] and self.fresh(result, now) else
+        state = ((4 if result.get('predicted') else 3 if result.get('sparse') else 1)
+                 if result['valid'] and self.fresh(result, now) else
                  0 if result['reason'] in WARMUP_STATES else 2)
-        return state | (4 if result['approximate'] else 0)
+        return state | (8 if result['approximate'] else 0)
 
     def summary(self, result, now):
         state = self.state(result, now)
-        label = DISPLAY_STATES[state & 3]+('（近似）' if state & 4 else '')
+        label = DISPLAY_STATES[state & 7]+('（近似）' if state & 8 else '')
         relative = self.relative(result, now)
         position = 'ΔN=-- ΔE=--' if relative is None else 'ΔN=%+.3fm ΔE=%+.3fm' % relative
-        height = None if not self.fresh(result, now) else result['height']
+        fresh = self.fresh(result, now)
+        height = result['height'] if fresh else None
+        q = result.get('q') if fresh else None
+        attitude = '--'
+        if q is not None:
+            try:
+                attitude = '%+.1f/%+.1f/%+.1f°' % euler_degrees(q)
+            except (ValueError, TypeError):
+                pass
         warming = '（窗口统计中）' if not self.rate_ready else ''
-        print('状态=%s | %s | 高度=%sm | 处理=%.2fFPS | 可发布=%.2fHz | 有效率=%.1f%%%s' % (
-            label, position, number(height, 3), self.rates[0], self.rates[1], self.rates[2], warming))
+        print('状态=%s | %s | 高度=%sm | 横滚/俯仰/航向=%s | 处理=%.2fFPS | 可发布=%.2fHz | 有效率=%.1f%%%s' % (
+            label, position, number(height, 3), attitude, self.rates[0], self.rates[1], self.rates[2], warming))
         self.last_display, self.pending_display = now, False
 
     def commit_phase(self, i, duration):
@@ -451,12 +452,13 @@ class TestSession:
                 stop = True
                 break
             if action == 'origin':
-                self.pending_origin = query = True
-                if not new or not result['valid'] or not self.fresh(result, now):
+                self.pending_origin = True
+                if not new or not result['valid'] or not result.get('measured') or not self.fresh(result, now):
                     print('已收到Enter：等待下一有效新图像建立原点。')
             elif action == 'query':
                 query = True
-        if self.pending_origin and new and result['valid'] and self.fresh(result, now):
+        if (self.pending_origin and new and result['valid'] and result.get('measured')
+                and not result.get('predicted') and self.fresh(result, now)):
             self.origin = result['position'][0], result['position'][1]
             self.origin_id += 1
             self.pending_origin = False
@@ -464,7 +466,6 @@ class TestSession:
             self.rate_start, self.rate_ready = now, False
             self.rates[0] = self.rates[1] = self.rates[2] = 0.0
             print('初始点%d已建立，ΔN/ΔE归零；视觉跟踪与全程统计保留。' % self.origin_id)
-            query = True
         self.update_rates(now)
         state = self.state(self.last_result, now)
         if state != self.display_state:
@@ -501,7 +502,7 @@ class TestSession:
     def snapshot(self):
         elapsed = 0 if self.start is None else max(0, self.end-self.start)
         seconds = elapsed*1e-6
-        return dict(seconds=seconds, frames=self.frames, stable=self.valid_frames,
+        return dict(seconds=seconds, frames=self.frames, stable=self.valid_frames, predicted=self.predicted_frames,
             publishable=self.publish_frames, fps=None if not seconds else self.frames/seconds,
             publish_hz=None if not seconds else self.publish_frames/seconds,
             quality=None if not self.quality_count else self.quality_sum/self.quality_count,
@@ -509,8 +510,8 @@ class TestSession:
 
     def common_lines(self, snapshot, reason, error):
         yield '结束原因=%s | 测量时长=%.3fs\n' % (reason, snapshot['seconds'])
-        yield '总接收图像=%d | 稳定追踪帧=%d | 可发布帧=%d\n' % (
-            snapshot['frames'], snapshot['stable'], snapshot['publishable'])
+        yield '总接收图像=%d | 真实稳定追踪=%d | 短时预测=%d | 可发布帧=%d\n' % (
+            snapshot['frames'], snapshot['stable'], snapshot['predicted'], snapshot['publishable'])
         confidence = '无有效样本' if snapshot['quality'] is None else number(snapshot['quality'])+'/100'
         yield '平均处理=%sFPS | 平均可发布=%sHz | 平均置信度=%s | 有效率=%s%%\n' % (
             number(snapshot['fps']), number(snapshot['publish_hz']),
@@ -547,7 +548,7 @@ class TestSession:
         seconds = snapshot['seconds']
         write('有效定位=%.3fHz（仅MODE2）；无新图像/重复循环=%d\n' % (
             self.valid_frames/seconds if seconds else 0.0, self.no_new_loops))
-        write('关键启动配置：宽/高/特征上限/FAST/KLT迭代/曝光/增益/发布质量/发布限频/时序确认/方向确认=%r\n' % (self.start_config,))
+        write('关键启动配置：宽/高/特征目标/FAST/KLT迭代/曝光/增益/发布置信度/发布限频/时序确认/方向确认/sigma0(m)/预测上限(us)/重置上限(us)=%r\n' % (self.start_config,))
         write('\n视觉可靠性：样本数；最低/平均/最大\n')
         for i, name in enumerate(DETAIL_NAMES):
             count = self.detail_counts[i]

@@ -24,6 +24,22 @@ RNC = C.R_BC
 WIDTH, HEIGHT = 320, 240
 
 
+def inverse_rotate(r, v):
+    x,y,z=v
+    return (r[0]*x+r[3]*y+r[6]*z,r[1]*x+r[4]*y+r[7]*z,r[2]*x+r[5]*y+r[8]*z)
+
+
+def undistort(u, v):
+    """Independent PC geometry oracle; no unused helper is loaded on OpenMV."""
+    xd,yd=(u-C.CX)/C.FX,(v-C.CY)/C.FY
+    x,y=xd,yd
+    k1,k2,p1,p2,k3=C.DIST_COEFFS
+    for _ in range(6):
+        r=x*x+y*y;k=1+k1*r+k2*r*r+k3*r*r*r
+        x,y=(xd-2*p1*x*y-p2*(r+2*x*x))/k,(yd-p1*(r+2*y*y)-2*p2*x*y)/k
+    return x,y
+
+
 def build():
     folder = ROOT / 'native' / '_build'
     folder.mkdir(exist_ok=True)
@@ -41,6 +57,8 @@ def build():
     lib.vo_test_pairs.argtypes = [T.c_void_p, FP, FP, FP, T.c_int]
     lib.vo_test_limit.argtypes = [T.c_void_p, T.c_int, T.c_int]
     lib.vo_test_spoil_key.argtypes = [T.c_void_p]
+    lib.vo_test_search.argtypes = [T.c_void_p,T.c_void_p,T.c_void_p,F,F,F,F,FP]
+    lib.vo_test_search.restype = T.c_int
     lib.vo_profile.argtypes = [T.c_void_p, T.c_void_p]
     lib.vo_get_timings.argtypes = [T.c_void_p]
     lib.vo_get_timings.restype = T.POINTER(T.c_uint32)
@@ -64,7 +82,7 @@ class HostCore:
 
     def output(self, out):
         values = LIB.vo_get_result(self.ctx)
-        for i in range(31):
+        for i in range(A.RESULT_FLOATS):
             out[i] = values[i]
 
     def step(self, image, meta, stamp, prediction, out):
@@ -128,7 +146,7 @@ def render(position=(0, 0), q=(1, 0, 0, 0), height=1.5, arm=(0, 0, 0)):
 def pixel_of(ground, position, q, height, arm=(0, 0, 0)):
     r = A.q_matrix(q)
     lever = A.rotate(r, arm)
-    ray = A.inverse_rotate(A.matmul(r,C.R_BC),
+    ray = inverse_rotate(A.matmul(r,C.R_BC),
         (ground[0]-position[0]-lever[0],ground[1]-position[1]-lever[1],height))
     x,y = ray[0]/ray[2],ray[1]/ray[2]
     k1,k2,p1,p2,k3 = C.DIST_COEFFS
@@ -159,7 +177,7 @@ def check_frontend():
         check_position(motion,p)
         key_ids.append(motion['keyframe'])
     assert len(set(key_ids))==1, key_ids
-    last_key = engine.raw[14]
+    last_key = engine.raw[12]
     for k in range(8,33):
         p = (.012*k,-.009*k)
         motion = engine.process(render(p),(1,0,0,0),1.5,(0,0,0),100000+33333*k)
@@ -194,24 +212,24 @@ def check_geometry():
     pairs=[]
     for v in (40,80,120,160,200):
         for u in (40,90,140,190,240,280):
-            x,y = A.undistort(u,v)
+            x,y = undistort(u,v)
             g = A.rotate(C.R_BC,(x,y,1))
             uv = pixel_of((1.5*g[0]/g[2],1.5*g[1]/g[2]),position,true_q,1.5)
             pairs.extend((u,v,*uv))
     for i in range(0,20,4):
         pairs[4*i+2],pairs[4*i+3] = 45+i, 210-i
     LIB.vo_test_pairs(core.ctx,floats(rm),floats(current),floats(pairs),len(pairs)//4)
-    raw=[0]*31;core.output(raw)
+    raw=[0]*A.RESULT_FLOATS;core.output(raw)
     assert raw[0]==2 and math.dist(raw[3:5],position)<.003, raw
-    assert raw[5]==0 and raw[7]<raw[6], raw
+    assert raw[6]<raw[5], raw
     # Two collinear features are sufficient for translation, not for full pose.
     clean=[]
     for u,v in ((70,90),(240,90)):
-        x,y=A.undistort(u,v);g=A.rotate(C.R_BC,(x,y,1))
+        x,y=undistort(u,v);g=A.rotate(C.R_BC,(x,y,1))
         clean.extend((u,v,*pixel_of((1.5*g[0],1.5*g[1]),position,true_q,1.5)))
     LIB.vo_test_pairs(core.ctx,floats(rm),floats(current),floats(clean),2)
     core.output(raw)
-    assert raw[0]==2 and raw[27]==1 and math.dist(raw[3:5],position)<.003,raw
+    assert raw[0]==2 and raw[16]==1 and math.dist(raw[3:5],position)<.003,raw
     clean[6]+=20
     LIB.vo_test_pairs(core.ctx,floats(rm),floats(current),floats(clean),2)
     core.output(raw)
@@ -320,15 +338,15 @@ def check_controller():
     output.update(publication,0)
     assert link.sent==[result['timestamp_us']]
     C.SEND_ODOMETRY,C.SENSOR_TIMING_CONFIRMED=saved
-    old=C.LOST_RESET_US
-    C.LOST_RESET_US=50000
+    old=C.LOST_RESET_US,C.TRACK_HOLD_US
+    C.LOST_RESET_US,C.TRACK_HOLD_US=50000,20000
     for i in range(3):
         stamp+=33333;link.clock.now=stamp
         link.attitudes.append((stamp,(1,0,0,0),(0,0,0),stamp))
         link.ranges.append((stamp,1.5,.05,8,100,None,stamp))
         result=controller.process(Image(WIDTH*HEIGHT),stamp,link)
         assert not result['valid']
-    C.LOST_RESET_US=old
+    C.LOST_RESET_US,C.TRACK_HOLD_US=old
     assert result['reset_counter']==1,result
     print('PASS: native/Python controller, histories, display, publish-once and explicit reset')
 
@@ -345,7 +363,7 @@ def check_sparse_controller():
         def process(self,*args):
             n=self.count
             return dict(status=2 if n>=2 else 0,position=(0.1,0.2),delta=(0.0,0.0),
-                inliers=n,matches=n,keyframe=0,reference_height=1.5,residual_yaw=0.0,
+                inliers=n,matches=n,keyframe=0,reference_height=1.5,
                 sample_variance=(0.0,0.0),base_variance=(0.0,0.0),ratio=1.0,
                 effective_count=float(n),cells=min(6,n),spread=.2,residual_px=0.0)
     class Clock:
@@ -372,15 +390,169 @@ def check_sparse_controller():
         triple=frame(3);dual=frame(2);restored=frame(12)
         assert all(x['valid'] for x in (triple,dual,restored)),(triple,dual,restored)
         assert triple['reason']==dual['reason']=='SPARSE_TRACKING'
-        assert triple['quality']<=30 and dual['quality']<=20
         assert dual['variance'][0]>triple['variance'][0]>normal['variance'][0]>0
         assert dual['quality']<normal['quality'] and restored['position']==normal['position']
         assert controller.reset_counter==0
-        assert not frame(1)['valid']
-        assert not frame(2)['valid']  # genuine loss must reconfirm, unlike sparse transitions
+        assert frame(1)['predicted']
+        assert frame(2)['valid']  # short failure resumes on the next real fix
     finally:
         for name,value in saved.items(): setattr(C,name,value)
-    print('PASS: sparse quality caps, nonzero increasing variance, no reset/reconfirmation during sparse transitions, actual loss reconfirms')
+    print('PASS: unified sparse confidence, increasing variance and immediate recovery from a short failure')
+
+
+def check_brightness_search():
+    core=HostCore(A.native_settings())
+    reference=Image(90+hash_value(x,y)%61 for y in range(HEIGHT) for x in range(WIDTH))
+    ref=(T.c_uint8*len(reference)).from_buffer(reference)
+    for dx,dy,offset in ((6,-3,40),(-5,4,-40),(0,0,50)):
+        current=Image(WIDTH*HEIGHT)
+        for y in range(HEIGHT):
+            for x in range(WIDTH):
+                if 0<=x-dx<WIDTH and 0<=y-dy<HEIGHT:
+                    current[y*WIDTH+x]=reference[(y-dy)*WIDTH+x-dx]+offset
+        im=(T.c_uint8*len(current)).from_buffer(current)
+        out=(F*2)()
+        assert LIB.vo_test_search(core.ctx,ref,im,160,120,160,120,out)==1
+        assert tuple(out)==(160+dx,120+dy),(dx,dy,offset,tuple(out))
+    print('PASS: bounded fallback search tolerates +/-brightness offsets and finds known integer translations')
+
+
+def check_confidence_prediction():
+    from control import confidence
+    from main import validate_config
+    good=lambda variance,n=16,cells=6,ratio=1,weight=1: confidence((variance,variance),n,cells,ratio,n*weight)
+    scores=[good(v) for v in (0,.001,.01,.1,1)]
+    assert all(a>b for a,b in zip(scores,scores[1:])),scores
+    assert good(.001,16)==good(.001,24)==good(.001,64)
+    assert good(.001,2)<good(.001,16)
+    assert good(.001)-good(.001,cells=0)<=10
+    assert good(.001)-good(.001,ratio=0)<=10
+    assert good(.001)-good(.001,cells=0,ratio=0)<=20
+    assert confidence((float('nan'),0),16,6,1,16)==0
+    assert confidence((0,0),1,6,1,1)==0
+    saved=C.CONFIDENCE_SIGMA0_M
+    try:
+        before=good(.01);C.CONFIDENCE_SIGMA0_M*=2
+        assert good(.01)>before
+        for name,value in (('CONFIDENCE_SIGMA0_M',0),('TRACK_HOLD_US',C.LOST_RESET_US),
+                           ('PREDICTION_HISTORY_SIZE',1)):
+            old=getattr(C,name);setattr(C,name,value)
+            try:
+                try: validate_config()
+                except ValueError: pass
+                else: raise AssertionError('invalid parameter accepted: '+name)
+            finally: setattr(C,name,old)
+    finally:
+        C.CONFIDENCE_SIGMA0_M=saved
+    history=A.MotionHistory();origin=1<<40
+    for dt in (0,25000,58000,100000,145000):
+        history.add(origin+dt,(.4*dt*1e-6,-.2*dt*1e-6))
+    last_stamp=history.stamp
+    n=len(history.samples)
+    for dt in (100000,500000,C.TRACK_HOLD_US):
+        position,extra=history.project(last_stamp+dt)
+        expected=(.4*(145000+dt)*1e-6,-.2*(145000+dt)*1e-6)
+        assert math.dist(position,expected)<1e-10,(position,expected)
+        assert min(extra)>0 and history.stamp==last_stamp and len(history.samples)==n
+    assert history.project(last_stamp+C.TRACK_HOLD_US+1) is None
+    history.reset();history.add(origin,(1,2))
+    assert history.project(origin+100000)[0]==(1,2)
+    print('PASS: single confidence weighting, 16-point saturation, adjustable scales and bounded uint64-time motion prediction')
+
+
+def check_prediction_lifecycle():
+    from comm import History
+    from control import VOController
+    from output import publication_block_mask,PublicationGate
+    from test import TestSession
+    saved={name:getattr(C,name) for name in ('CAMERA_POS_B_M','TOF_POS_B_M',
+        'CAMERA_ORIENTATION_CONFIRMED','SENSOR_TIMING_CONFIRMED','TRACK_HOLD_US','LOST_RESET_US')}
+    class Engine:
+        success=True
+        diagnostics={'vision_reason':'MATCH_COUNT'}
+        def reset(self): pass
+        def accept_variance(self,*args): pass
+        def process(self,image,q,height,arm,stamp,rotation=None):
+            t=stamp*1e-6;n=24 if self.success else 0
+            return dict(status=2 if self.success else 0,position=(.4*t,-.2*t),delta=(.02,-.01),
+                inliers=n,matches=n,keyframe=0,reference_height=1.5,sample_variance=(0,0),
+                base_variance=(0,0),ratio=1,cells=6,effective_count=n,residual_px=0)
+    class Clock:
+        now=100000
+        def now_us(self): return self.now
+    class Link:
+        boot_generation=time_generation=0
+        range_ambiguous=False
+        vibration=None
+        def __init__(self): self.clock=Clock();self.attitudes=History();self.ranges=History()
+        def connected(self,now=None): return True
+        def synced(self,now=None): return True
+        def fc_time(self,stamp): return stamp
+    try:
+        C.CAMERA_POS_B_M=C.TOF_POS_B_M=(0,0,0)
+        C.CAMERA_ORIENTATION_CONFIRMED=C.SENSOR_TIMING_CONFIRMED=True
+        engine=Engine();link=Link();controller=VOController(engine)
+        def frame(stamp,success=True):
+            engine.success=success;link.clock.now=stamp
+            link.attitudes.append((stamp,(1,0,0,0),(0,0,0),stamp))
+            link.ranges.append((stamp,1.5,.05,8,100,None,stamp))
+            return controller.process(Image(),stamp,link)
+        for i in range(8): measured=frame(100000+i*50000)
+        assert measured['valid'] and measured['measured']
+        anchor=measured['timestamp_us']
+        before_count=len(controller.predictor.samples)
+        first=frame(anchor+50000,False)
+        second=frame(anchor+100000,False)
+        assert all(r['valid'] and r['predicted'] and not r['measured'] for r in (first,second))
+        for r in (first,second):
+            assert r['measurement_timestamp_us']==anchor
+            assert math.dist(r['position'],(.4*r['timestamp_us']*1e-6,-.2*r['timestamp_us']*1e-6))<1e-10
+            assert publication_block_mask(r,link,r['timestamp_us']) & 128
+            assert not PublicationGate().accept(r,r['timestamp_us'],0)
+        assert controller.last_success_stamp==anchor and len(controller.predictor.samples)==before_count
+        assert second['variance'][0]>first['variance'][0]>measured['variance'][0]
+        assert second['quality']<=first['quality']<=measured['quality']
+        recovered=frame(anchor+150000)
+        assert recovered['valid'] and recovered['measured'] and not recovered['predicted']
+        # Prediction frames remain new input images, but do not count as fixes.
+        session=TestSession(1);session.link=link;session.start=0
+        for r in (measured,first,second,recovered): session.observe(r,r['timestamp_us'])
+        assert (session.frames,session.valid_frames,session.predicted_frames)==(4,2,2)
+        assert session.lost_episodes==0 and session.quality_count==2
+        assert session.state(second,second['timestamp_us']) & 7 == 4
+        anchor=recovered['timestamp_us']
+        last_prediction=frame(anchor+C.TRACK_HOLD_US,False)
+        assert last_prediction['valid'] and last_prediction['predicted']
+        lost=frame(anchor+C.TRACK_HOLD_US+1,False)
+        assert not lost['valid'] and lost['reason']=='LOST' and lost['reset_counter']==0
+        reconfirm=frame(anchor+C.TRACK_HOLD_US+50000)
+        assert not reconfirm['valid'] and reconfirm['reason']=='POSE_RECOVERING'
+        frame(anchor+C.TRACK_HOLD_US+100000)
+        recovered=frame(anchor+C.TRACK_HOLD_US+150000)
+        assert recovered['valid'] and recovered['reset_counter']==0
+        anchor=recovered['timestamp_us']
+        assert frame(anchor+C.LOST_RESET_US-1,False)['reset_counter']==0
+        reset=frame(anchor+C.LOST_RESET_US,False)
+        assert reset['reason']=='REINITIALIZING' and reset['reset_counter']==1
+        assert not reset['valid'] and controller.predictor.stamp is None
+        # A hard input generation change cannot reuse the previous trajectory.
+        for i in range(8): frame(anchor+C.LOST_RESET_US+50000*(i+1))
+        assert controller.tracking_confirmed
+        link.boot_generation+=1
+        changed=frame(link.clock.now+50000,False)
+        assert not changed['predicted'] and not changed['valid']
+        # The hold and reset limits really follow config.py, including the boundary.
+        C.TRACK_HOLD_US=40000;C.LOST_RESET_US=120000
+        engine=Engine();link=Link();controller=VOController(engine)
+        for i in range(8): measured=frame(100000+i*20000)
+        assert measured['valid']
+        anchor=measured['timestamp_us']
+        assert frame(anchor+40000,False)['predicted']
+        assert not frame(anchor+40001,False)['valid']
+        assert frame(anchor+120000,False)['reason']=='REINITIALIZING'
+    finally:
+        for name,value in saved.items(): setattr(C,name,value)
+    print('PASS: predicted positions, no feedback/publication/stat inflation, immediate recovery, configurable 1s/3s boundaries and reset epochs')
 
 
 def check_work_bounds():
@@ -430,13 +602,13 @@ import sys
 sys.path.insert(0, %r)
 from array import array
 import rm_vo, algorithm as A, config as C
-assert rm_vo.ABI_VERSION==2
+assert rm_vo.ABI_VERSION==3 and rm_vo.RESULT_FLOATS==23
 core=rm_vo.Core(A.native_settings())
 core.profile(True)
 meta=array('f', C.R_BC+(0,0,0,1.5))
 stamp=array('I',(100000,1))
 prediction=array('f',(0,0,8))
-out=array('f',[0]*31)
+out=array('f',[0]*23)
 with open(%r,'rb') as f: reference=bytearray(f.read())
 with open(%r,'rb') as f: shifted=bytearray(f.read())
 core.step(reference,meta,stamp,prediction,out)
@@ -445,7 +617,13 @@ reference[:]=bytes(len(reference))
 stamp[0]=133333
 core.step(shifted,meta,stamp,prediction,out)
 assert out[0]==2 and abs(out[1]-.012)<.006 and abs(out[2]+.009)<.006,out
-assert abs(out[18]-.033333)<.00001 and out[23]==1,out
+assert out[19]==1 and len(out)==23,out
+stamp[0]=166666;stamp[1]=0
+core.step(shifted,meta,stamp,prediction,out)
+assert out[0]==-2,out
+stamp[0]=0;stamp[1]=2
+core.step(shifted,meta,stamp,prediction,out)
+assert out[0]==2,out
 timing=array('I',[0]*6)
 core.timings(timing)
 assert sum(timing)>0,timing
@@ -458,7 +636,7 @@ core.reset()
 stamp[0]=166666
 core.step(shifted,meta,stamp,prediction,out)
 assert out[0]==1
-print('PASS: actual MicroPython ABI2 binding, uint64 time, buffers, native timings and reset')
+print('PASS: actual MicroPython ABI3 binding, uint64 time, buffers, native timings and reset')
 class Image:
     def __init__(self,data): self.data=data
     def width(self): return 320
@@ -487,25 +665,38 @@ motion=engine.process(Image(shifted),(1,0,0,0),1.5,(0,0,0),(1<<32)+133333)
 assert motion['status']==2 and motion['sparse'] and motion['attempts']==1,motion
 assert abs(motion['position'][0]-.012)<.006 and probe.count==2,motion
 print('PASS: real MicroPython frontend, two-point native flow and profiling, no ORB')
+history=A.MotionHistory()
+for i in range(5): history.add((1<<40)+i*30000,(.01*i,-.02*i))
+position,extra=history.project((1<<40)+220000)
+assert abs(position[0]-(.04+.01/.03*.1))<1e-6 and min(extra)>0,position
+assert len(history.samples)==5 and history.stamp==(1<<40)+120000
+assert history.project(history.stamp+C.TRACK_HOLD_US+1) is None
+from control import confidence
+assert confidence((.001,.001),16,6,1,16)==confidence((.001,.001),24,6,1,24)
+assert confidence((.001,.001),16,6,1,16)>confidence((.1,.1),16,6,1,16)
+print('PASS: actual MicroPython temporal regression, prediction provenance and unified confidence')
 ''' % (str(ROOT),str(folder/'reference.gray'),str(folder/'shifted.gray'),str(folder/'reference.gray'))
     subprocess.run([str(executable),'-X','heapsize=4M','-c',script],cwd=ROOT,check=True)
 
 
 if __name__=='__main__':
     LIB=build()
-    sys.modules['rm_vo']=types.SimpleNamespace(Core=HostCore,ABI_VERSION=2)
+    sys.modules['rm_vo']=types.SimpleNamespace(Core=HostCore,ABI_VERSION=3)
     sys.modules['image']=types.SimpleNamespace(GRAYSCALE=1,CORNER_FAST=0,CORNER_AGAST=1)
     for p in ROOT.glob('*.py'):
         compile(p.read_text(encoding='utf-8'),str(p),'exec')
-    RAYS=[A.undistort(u,v) for v in range(HEIGHT) for u in range(WIDTH)]
+    RAYS=[undistort(u,v) for v in range(HEIGHT) for u in range(WIDTH)]
     print('C context bytes:',LIB.vo_context_bytes(),flush=True)
     check_fast_equivalence()
     check_frontend()
     check_rotations()
     check_geometry()
     check_sparse_images()
+    check_brightness_search()
     check_controller()
     check_sparse_controller()
+    check_confidence_prediction()
+    check_prediction_lifecycle()
     check_work_bounds()
     if '--micropython' in sys.argv:
         check_micropython(sys.argv[sys.argv.index('--micropython')+1])

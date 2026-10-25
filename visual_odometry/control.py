@@ -8,6 +8,18 @@ import algorithm as A
 from comm import History
 
 
+def confidence(variance, count, cells, ratio, effective):
+    """唯一0~100工程评分；方差70%，点数/覆盖/匹配各10%。"""
+    if count < 2 or not all(A.finite(v) and v >= 0 for v in variance):
+        return 0
+    sigma2 = C.CONFIDENCE_SIGMA0_M**2
+    v = sigma2/(sigma2+max(variance))
+    n = min(1.0, count/C.CONFIDENCE_FULL_POINTS)
+    c = max(0.0, min(1.0, cells/C.CONFIDENCE_FULL_CELLS))
+    m = max(0.0, min(1.0, ratio))*max(0.0, min(1.0, effective/count))
+    return max(0, min(100, int(100*(.70*v+.10*n+.10*c+.10*m)+.5)))
+
+
 def attitude_at(history, stamp):
     """飞控时钟域；有括号时SLERP，否则只在短窗口内用机体系角速度预测。"""
     if not history:
@@ -81,10 +93,12 @@ class HeightTracker:
         if link.range_ambiguous:
             self.reject("SELECT_TOF_ID")
             return
-        for item in link.ranges:
+        first = len(link.ranges)
+        while first and link.ranges[first-1][0] > self.last_stamp:
+            first -= 1
+        for index in range(first, len(link.ranges)):
+            item = link.ranges[index]
             stamp, distance, low, high, quality, variance, received = item
-            if stamp <= self.last_stamp:
-                continue
             detail = range_invalid_detail(distance, low, high, quality)
             if detail is not None:
                 self.last_stamp = stamp
@@ -162,7 +176,8 @@ class HeightTracker:
 
 class VOController:
     def __init__(self, engine=None):
-        self.engine = engine if engine is not None else A.FeatureEngine()
+        self.predictor = A.MotionHistory()
+        self.engine = engine if engine is not None else A.FeatureEngine(predictor=self.predictor)
         self.height = HeightTracker()
         self.reset_counter = 0
         self.keyframe_id = 0
@@ -172,15 +187,20 @@ class VOController:
         self.previous_attitude = None
         self.previous_clipping = None
         self.clipping_until = 0
-        self.lost_since = None
+        self.last_success_stamp = self.failure_since = None
+        self.last_measurement = None
+        self.tracking_confirmed = False
 
     def reset(self):
         self.engine.reset()
+        self.predictor.reset()
         self.good_frames = 0
         self.previous_attitude = None
         self.reset_counter = (self.reset_counter+1) & 255
         self.keyframe_id = 0  # IDs are local to the reset_counter epoch.
-        self.lost_since = None
+        self.last_success_stamp = self.failure_since = None
+        self.last_measurement = None
+        self.tracking_confirmed = False
 
     def _result(self, stamp, reason, q=None, height=None, approximate=False):
         result = {"timestamp_us": stamp, "position": None, "q": q,
@@ -188,14 +208,45 @@ class VOController:
                   "body_valid": False, "reason": reason, "approximate": approximate,
                   "reset_counter": self.reset_counter, "variance": (1.0, 1.0),
                   "keyframe": self.keyframe_id, "matches": 0, "inliers": 0,
-                  "residual_px": None, "sparse": False}
+                  "residual_px": None, "sparse": False, "measured": False,
+                  "predicted": False, "measurement_timestamp_us": None,
+                  "prediction_age_us": 0}
         result["range_detail"] = self.height.reject_detail
         result["range_state"] = self.height.reason
         result["range_skipped_attitude"] = self.height.skipped_attitude
         result["vision"] = None
         return result
 
-    def process(self, image, stamp, link, statistics=None):
+    def _failed(self, result, stamp, reason, allow_prediction=True):
+        result['reason'] = result['failure_reason'] = reason
+        if self.failure_since is None:
+            self.failure_since = stamp
+        anchor = self.last_success_stamp if self.last_success_stamp is not None else self.failure_since
+        age = stamp-anchor
+        if age >= C.LOST_RESET_US:
+            self.reset()
+            result.update(reason='REINITIALIZING', reset_counter=self.reset_counter,
+                          keyframe=self.keyframe_id)
+            return result
+        projection = self.predictor.project(stamp) if allow_prediction and self.tracking_confirmed else None
+        if projection is not None and self.last_measurement is not None:
+            last = self.last_measurement
+            position, extra = projection
+            variance = tuple(last['variance'][i]+extra[i] for i in range(2))
+            result.update(position=position, variance=variance, valid=True,
+                          body_valid=last['body_valid'] and not result['approximate'],
+                          quality=confidence(variance, *last['score_data']),
+                          reason='PREDICTING', predicted=True,
+                          measurement_timestamp_us=last['stamp'], prediction_age_us=age,
+                          sparse=last['sparse'])
+            return result
+        self.good_frames = 0
+        self.tracking_confirmed = False
+        if self.last_measurement is not None:
+            result['reason'] = 'LOST'
+        return result
+
+    def process(self, image, stamp, link, statistics=None, attitude=None):
         now = link.clock.now_us()
         if self.generation is None:
             self.generation = link.boot_generation
@@ -212,14 +263,17 @@ class VOController:
             self.time_generation = link.time_generation
         if not link.connected(now):
             self.good_frames = 0
+            self.tracking_confirmed = False
             return self._result(stamp, "WAIT_HEARTBEAT")
         if not link.synced(now):
             self.good_frames = 0
+            self.tracking_confirmed = False
             return self._result(stamp, "TIME_UNSYNCED")
         fc_stamp = link.fc_time(stamp)
-        attitude = attitude_at(link.attitudes, fc_stamp)
+        attitude = attitude_at(link.attitudes, fc_stamp) if attitude is None else attitude
         if attitude is None:
             self.good_frames = 0
+            self.tracking_confirmed = False
             return self._result(stamp, "WAIT_ATTITUDE")
         q, gyro, attitude_age = attitude
         r = A.q_matrix(q)
@@ -238,6 +292,7 @@ class VOController:
         result = self._result(stamp, "WAIT_RANGE", q, body_height, approximate)
         if hc is None or hc <= 0.001:
             self.good_frames = 0
+            self.tracking_confirmed = False
             result["height"] = None
             result["reason"] = self.height.reason if not self.height.valid else "RANGE_STALE"
             return result
@@ -255,6 +310,7 @@ class VOController:
         if ((C.MAX_TILT_DEG is not None and r[8] < math.cos(C.MAX_TILT_DEG*math.pi/180))
                 or (C.MAX_GYRO_RAD_S is not None and speed > C.MAX_GYRO_RAD_S)):
             self.good_frames = 0
+            self.tracking_confirmed = False
             result["reason"] = "DYNAMIC_LIMIT"
             result["height"] = None
             return result
@@ -267,41 +323,43 @@ class VOController:
                          and any(x > limit for x, limit in zip(metrics, C.VIBRATION_LIMITS)))
             if now < self.clipping_until or excessive:
                 self.good_frames = 0
+                self.tracking_confirmed = False
                 result["reason"] = "VIBRATION"
                 result["height"] = None
                 return result
         if C.MIN_IMAGE_STDEV is not None and statistics is None:
             statistics = image.get_statistics()
         if C.MIN_IMAGE_STDEV is not None and statistics.stdev() < C.MIN_IMAGE_STDEV:
-            self.good_frames = 0
-            result["reason"] = "LOW_TEXTURE"
+            return self._failed(result, stamp, 'LOW_TEXTURE')
+        # The deadline is relative to the last real success, never to a
+        # predicted output. Do not attach a >=3s gap to an old origin.
+        if self.last_success_stamp is not None and stamp-self.last_success_stamp >= C.LOST_RESET_US:
+            self.reset()
+            result.update(reason='REINITIALIZING', reset_counter=self.reset_counter,
+                          keyframe=self.keyframe_id)
             return result
-        motion = self.engine.process(image, q, hc, camera_pos, stamp)
+        motion = self.engine.process(image, q, hc, camera_pos, stamp, r)
         result["vision"] = getattr(self.engine, "diagnostics", None)
         result["matches"] = motion["matches"]
         result["inliers"] = motion["inliers"]
         result["keyframe"] = self.keyframe_id = motion["keyframe"]
         if motion["status"] == 1:
             self.good_frames = 0
-            self.lost_since = None
+            self.tracking_confirmed = False
+            self.failure_since = None
             result["reason"] = "INITIALIZING"
             return result
         if motion["status"] != 2:
-            self.good_frames = 0
             detail = (result["vision"] or {}).get("vision_reason")
-            result["reason"] = ("NO_FEATURES" if motion["status"] == -1 else detail
+            reason = ("NO_FEATURES" if motion["status"] == -1 else detail
                                 if detail in ("MATCH_COUNT", "INLIER_RATIO", "AMBIGUOUS_MATCH",
-                                              "PATCH_UNRELIABLE", "INPUT_INVALID") else "LOST")
-            if self.lost_since is None:
-                self.lost_since = stamp
-            elif stamp-self.lost_since >= C.LOST_RESET_US:
-                # Unknown displacement is never attached to the last position.
-                # A new zero origin is explicit and visible in reset_counter.
-                self.reset()
-                result.update(reason="REINITIALIZING", reset_counter=self.reset_counter,
-                              keyframe=self.keyframe_id)
-            return result
-        self.lost_since = None
+                                               "INPUT_INVALID") else "LOST")
+            return self._failed(result, stamp, reason, motion['status'] != -2)
+        if self.last_success_stamp is not None and stamp-self.last_success_stamp > C.TRACK_HOLD_US:
+            self.good_frames = 0
+            self.tracking_confirmed = False
+        self.last_success_stamp = stamp
+        self.failure_since = None
         delta = motion["delta"]
         position = motion["position"]
         count = motion["inliers"]
@@ -319,34 +377,29 @@ class VOController:
         effective = max(0.5, motion.get("effective_count", count))
         inflation = (C.TWO_POINT_VARIANCE_FACTOR if count == 2 else
                      C.THREE_POINT_VARIANCE_FACTOR if count == 3 else 1.0)
-        variance = tuple(motion["base_variance"][i]+sigma_common2
+        reference_variance = tuple(motion["base_variance"][i]+sigma_common2
                          +inflation*max(pixel_var, motion["sample_variance"][i])/effective
                          for i in range(2))
-        freshness = max(0.1, 1.0-0.5*height_sample[2]/C.MAX_RANGE_AGE_US)
-        geometric = min(1.0, count/30.0)*motion["ratio"]
-        geometric *= max(0.1, 1.0-0.5*motion["residual_px"]/C.RANSAC_THRESHOLD_PX)
-        geometric *= (.3+.7*min(1.0, motion["cells"]/6.0))
-        geometric *= (.3+.7*min(1.0, motion["spread"]/.12))
-        geometric *= min(1.0, effective/count)
-        quality = max(1, min(100, int(100*geometric*freshness)))
         sparse = count <= C.SPARSE_MAX_INLIERS
-        if count == 2:
-            quality = min(quality, C.TWO_POINT_QUALITY_CAP)
-        elif count == 3:
-            quality = min(quality, C.THREE_POINT_QUALITY_CAP)
-        if approximate:
-            quality = min(quality, C.APPROXIMATE_QUALITY_CAP)
-            variance = tuple(v+0.1**2 for v in variance)
-        self.engine.accept_variance(motion, variance)
+        # Unknown calibration is a shared output uncertainty, not a new
+        # independent 10cm error to accumulate on every reference-chain edge.
+        variance = tuple(v+(0.1**2 if approximate else 0.0) for v in reference_variance)
+        score_data = (count,motion['cells'],motion['ratio'],effective)
+        quality = confidence(variance, *score_data)
+        self.engine.accept_variance(motion, reference_variance)
+        self.predictor.add(stamp, position)
         self.good_frames += 1
         result.update(position=position, variance=variance, matches=motion["matches"],
                       inliers=count, residual_px=motion["residual_px"], quality=quality,
                       reason="SPARSE_TRACKING" if sparse else "TRACKING", sparse=sparse,
                       attitude_age_us=attitude_age,
-                      range_age_us=height_sample[2], residual_yaw=motion["residual_yaw"])
-        if self.good_frames < C.POSE_RECOVERY_FRAMES:
+                      range_age_us=height_sample[2], measured=True, measurement_timestamp_us=stamp)
+        if not self.tracking_confirmed and self.good_frames < C.POSE_RECOVERY_FRAMES:
             result.update(position=None, quality=0, reason="POSE_RECOVERING")
             return result
         result["valid"] = True
         result["body_valid"] = not approximate
+        self.tracking_confirmed = True
+        self.last_measurement = dict(stamp=stamp, variance=variance, score_data=score_data,
+                                     body_valid=not approximate, sparse=sparse)
         return result

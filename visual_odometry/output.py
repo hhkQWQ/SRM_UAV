@@ -4,7 +4,7 @@ from algorithm import euler_degrees
 
 
 _STATES = {
-    "TRACKING": "跟踪正常", "SPARSE_TRACKING": "少点跟踪", "INITIALIZING": "建立参考图",
+    "TRACKING": "跟踪正常", "SPARSE_TRACKING": "少点跟踪", "PREDICTING": "短时预测", "INITIALIZING": "建立参考图",
     "REINITIALIZING": "轨迹重置，下帧重建原点", "POSE_RECOVERING": "确认跟踪稳定",
     "WAIT_HEARTBEAT": "等待飞控连接", "TIME_UNSYNCED": "等待时钟同步",
     "WAIT_ATTITUDE": "等待图像时刻的姿态", "EXTRINSICS_PENDING": "等待安装参数",
@@ -15,13 +15,12 @@ _STATES = {
     "RANGE_STALE": "高度过期或无效", "ATTITUDE_RESET": "姿态跳变，重新初始化",
     "DYNAMIC_LIMIT": "倾角或转速过大", "VIBRATION": "振动超限",
     "LOW_TEXTURE": "画面纹理不足", "NO_FEATURES": "角点不足",
-    "FEATURES_1D": "特征主要在一条线上", "FEATURES_CLUSTERED": "特征过于集中",
-    "LOST": "跟踪丢失", "MATCH_COUNT": "匹配点不足", "INLIERS": "可靠匹配不足",
-    "INLIER_RATIO": "可靠匹配比例低", "COVERAGE": "匹配覆盖范围不足",
+    "LOST": "跟踪丢失", "MATCH_COUNT": "匹配点不足",
+    "INLIER_RATIO": "可靠匹配比例低",
     "NOT_FINITE": "距离非数值", "LIMITS_INVALID": "量程无效",
     "SIGNAL_INVALID": "传感器报告无效", "TOO_NEAR": "距离过近", "TOO_FAR": "距离过远",
-    "AMBIGUOUS_MATCH": "匹配有歧义", "PATCH_UNRELIABLE": "窗口纹理或跟踪不可靠",
-    "INPUT_INVALID": "视觉输入无效", "OK": "可用", "READY": "特征就绪", "TRACK_FAILED": "视觉跟踪失败，原因未细分",
+    "AMBIGUOUS_MATCH": "匹配有歧义",
+    "INPUT_INVALID": "视觉输入无效", "OK": "可用", "TRACK_FAILED": "视觉跟踪失败，原因未细分",
 }
 
 
@@ -30,7 +29,7 @@ def _state(code):
 
 
 BLOCK_CODES = ("TIMING_UNCONFIRMED", "POSITION_INVALID", "EXTRINSICS_UNCONFIRMED",
-               "LOW_QUALITY", "DISCONNECTED", "UNSYNCED", "OBSERVATION_STALE")
+               "LOW_QUALITY", "DISCONNECTED", "UNSYNCED", "OBSERVATION_STALE", "NOT_MEASURED")
 
 
 def publication_block_mask(result, link, now):
@@ -50,6 +49,8 @@ def publication_block_mask(result, link, now):
         mask |= 32
     if not 0 <= now-result["timestamp_us"] <= C.MAX_TX_AGE_US:
         mask |= 64
+    if result.get('predicted', False) or not result.get('measured', False):
+        mask |= 128
     return mask
 
 
@@ -66,7 +67,8 @@ class PublicationGate:
         self.last_stamp = -1
 
     def accept(self, result, now, blockers):
-        if (blockers or result["timestamp_us"] <= self.last_stamp
+        if (blockers or result.get('predicted', False) or not result.get('measured', False)
+                or result["timestamp_us"] <= self.last_stamp
                 or now-self.last_publish < int(1000000/C.ODOMETRY_HZ)):
             return False
         self.last_publish, self.last_stamp = now, result["timestamp_us"]
@@ -115,6 +117,6 @@ class Output:
         height = "--" if result["height"] is None else "%.3f m" % result["height"]
         attitude = ("--" if result["q"] is None else
                     "%+.1f/%+.1f/%+.1f 度" % euler_degrees(result["q"]))
-        print("状态=%s | %s | 高度=%s | 横滚/俯仰/航向=%s | FPS=%.1f | 质量=%d/100" % (
+        print("状态=%s | %s | 高度=%s | 横滚/俯仰/航向=%s | FPS=%.1f | 置信度=%d/100" % (
             status, position, height, attitude, fps, result["quality"] if result["valid"] else 0))
 

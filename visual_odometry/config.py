@@ -14,7 +14,6 @@ CY = 117.66487385855488
 DIST_COEFFS = (0.09984656079919686, -0.23986524630434,
                -0.0007887596884331264, 0.00012132382106465136,
                0.16915439320944928)
-UNDISTORT_ITERATIONS = 6
 
 # 下视，画面上方=机头、画面右方=机体右。R_BC将光学向量变换到机体系。
 R_BC = (0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
@@ -23,7 +22,6 @@ CAMERA_POS_B_M = None                # 待填 (前, 右, 下)，单位m
 TOF_POS_B_M = None                   # 待填 (前, 右, 下)，单位m
 TOF_AXIS_B = (0.0, 0.0, 1.0)
 ALLOW_APPROXIMATE_EXTRINSICS = True   # 共点近似：输出标“近似”，不回传有效ODOMETRY
-APPROXIMATE_QUALITY_CAP = 35
 
 # ---------- 采图与时间 ----------
 EXPOSURE_US = 6000                   # 启动曝光；随后按亮度和预测像素速度调节
@@ -91,9 +89,9 @@ CLIPPING_HOLD_US = 500000
 ATTITUDE_RESET_MARGIN_RAD = 0.20
 
 # ---------- 原生FAST / 稀疏KLT / 姿态高度辅助二维平移 ----------
-MAX_KEYPOINTS = 48                 # 正常目标48；固定容量64，少点不主动重置
+MAX_KEYPOINTS = 24                 # 正常目标24；原生容量64，最低2个可靠点可继续跟踪
 FAST_THRESHOLD = 15               # OpenMV v4.5.9 FAST-9灰度差阈值，无ORB描述子
-FEATURE_TOPUP_RATIO = 0.75
+FEATURE_TOPUP_RATIO = 0.75         # 少于目标的75%才补点；24点目标对应低于18点
 FEATURE_TOPUP_CELLS = 6            # 每帧最多扫描缺点网格数，轮转覆盖6x4网格
 FEATURE_TOPUP_POINTS = 4           # 每帧最多新增4点；首张初始化图可全网格检测
 KLT_MAX_ITERATIONS = 12            # 模板梯度/矩阵预计算一次，保留收敛预算
@@ -103,21 +101,21 @@ KLT_FB_ERROR_PX = 1.5
 SEARCH_MIN_PX = 6
 SEARCH_MAX_PX = 8                  # 不再扩大到40px或反复换参考
 SAD_UNIQUENESS_RATIO = 0.90        # 最佳代价必须低于另一独立峰的90%
-PREDICTION_MAX_AGE_US = 200000     # 预测仅用于寻找匹配，不能作为测量
 KEYFRAME_CHECK_INTERVAL = 5        # 每5帧选择关键帧；每帧仅一轮完整跟踪
 TEMPLATE_WARP_ANGLE_RAD = 0.0174533 # 相对旋转超过约1度时重采样仿射模板
 TEMPLATE_WARP_HEIGHT_RATIO = 0.02  # 相对高度变化超过2%时重采样
-LOST_RESET_US = 2000000
+TRACK_HOLD_US = 1000000            # us；距最后真实匹配<=1s时预测位置，调大可容忍更长遮挡但漂移增大
+LOST_RESET_US = 3000000            # us；距最后真实匹配>=3s时重建原点，必须大于TRACK_HOLD_US
+PREDICTION_HISTORY_SIZE = 5        # 最近真实成功结果数量，用实际时间拟合匀速；预测结果不入历史
+PREDICTION_VELOCITY_STD_M_S = 0.5  # m/s；速度不确定度下限，调大使预测方差增长更快、置信度更低
 MIN_MATCHES = 2
 MIN_INLIERS = 2
 MIN_INLIER_RATIO = 0.55            # 同时要求严格多数；双点必须全部一致
-SPARSE_MAX_INLIERS = 3            # ABI 2固定将2/3内点视作少点状态
-TWO_POINT_QUALITY_CAP = 20
-THREE_POINT_QUALITY_CAP = 30
+SPARSE_MAX_INLIERS = 3             # 2/3内点标记少点状态，使用统一置信度公式
 TWO_POINT_VARIANCE_FACTOR = 4.0    # 放大随机测量项，公共误差保持独立下限
 THREE_POINT_VARIANCE_FACTOR = 2.0
 MIN_RAY_DOWN = 0.25
-RANSAC_THRESHOLD_PX = 2.5          # 保留配置名；现为确定性平移重投影门槛
+TRANSLATION_GATE_PX = 2.5          # px；平移一致性重投影门槛，调大更宽松，不执行RANSAC
 KEYFRAME_DISTANCE_HEIGHT_RATIO = 0.25
 KEYFRAME_HEIGHT_RATIO = 1.25
 KEYFRAME_ROTATION_RAD = 0.25
@@ -126,10 +124,15 @@ POSITION_NOISE_FLOOR_M = 0.02
 ATTITUDE_STD_RAD = 0.00873
 PIXEL_STD = 0.8
 
+# ---------- 唯一置信度：70%方差 + 10%点数 + 10%覆盖 + 10%匹配质量 ----------
+CONFIDENCE_SIGMA0_M = 0.05         # m；位置标准差达到此值时方差项得半分，调大使同等误差评分更高
+CONFIDENCE_FULL_POINTS = 16        # 可靠内点达到16即点数项满分；超过16不继续加分
+CONFIDENCE_FULL_CELLS = 6          # 3x3网格覆盖6格即覆盖项满分，不再叠乘分散程度惩罚
+
 # ---------- 输出：只有水平位置融合 ----------
 SEND_ODOMETRY = False               # 旁路检查后显式开启；不会修改飞控任何EKF参数
 ODOMETRY_HZ = 30
-MIN_PUBLISH_QUALITY = 40
+MIN_PUBLISH_QUALITY = 40           # 0~100唯一置信度的发布门槛；预测位置不作为新视觉测量回传
 Z_PLACEHOLDER_VARIANCE = 1000000.0
 DISPLAY_HZ = 2                      # 中文状态摘要频率，不影响运算/回传频率
 
