@@ -8,7 +8,7 @@ import config as C
 _INF = float("inf")
 _VISION_REASONS = ('OK', 'MATCH_COUNT', 'INLIER_RATIO', 'AMBIGUOUS_MATCH',
                    'INPUT_INVALID', 'INITIALIZING')
-RESULT_FLOATS = 23
+RESULT_FLOATS = 34
 
 
 def _us():
@@ -143,7 +143,7 @@ class FeatureEngine:
             import rm_vo
         except ImportError:
             raise RuntimeError("缺少rm_vo原生模块：请按README编译并安装固件")
-        if rm_vo.ABI_VERSION != 3:
+        if rm_vo.ABI_VERSION != 4 or rm_vo.RESULT_FLOATS != RESULT_FLOATS:
             raise RuntimeError("rm_vo接口版本不匹配，请更新固件和全部Python文件")
         import image
         self.image_module = image
@@ -202,6 +202,19 @@ class FeatureEngine:
         self.diagnostics['sparse'] = bool(raw[16]) and status==2
         reason = int(raw[17])
         self.diagnostics['vision_reason'] = _VISION_REASONS[reason] if 0<=reason<len(_VISION_REASONS) else 'TRACK_FAILED'
+        self.diagnostics['base'] = base
+        self.diagnostics['ref_count'] = int(raw[23])
+        self.diagnostics['projected'] = int(raw[24])
+        self.diagnostics['klt_eig_reject'] = int(raw[25])
+        self.diagnostics['klt_fail'] = int(raw[26])
+        self.diagnostics['fb_reject'] = int(raw[27])
+        self.diagnostics['sad_fail'] = int(raw[28])
+        self.diagnostics['fast_candidates'] = int(raw[29])
+        self.diagnostics['weak_candidates'] = int(raw[30])
+        self.diagnostics['new_prev_count'] = int(raw[31])
+        self.diagnostics['new_prev_survived'] = int(raw[32])
+        self.diagnostics['added'] = int(raw[22])
+        self.diagnostics['detect_cells'] = int(raw[21])
         base_variance = self.previous_variance if base else self.key_variance
         if status==2 and self.owns_predictor:
             self.predictor.add(stamp,(raw[1],raw[2]))
@@ -210,8 +223,14 @@ class FeatureEngine:
             cells=int(raw[8]),residual_px=raw[9],
             sample_variance=(raw[10],raw[11]),keyframe=int(raw[12]),key_changed=key_changed,
             reference_height=raw[15],base_variance=base_variance,
-            effective_count=raw[18],sparse=bool(raw[16]),attempts=int(raw[19]),
-            sad_candidates=int(raw[20]),detect_cells=int(raw[21]),added=int(raw[22]))
+            effective_count=raw[18],match_weight_sum=raw[33],
+            sparse=bool(raw[16]),attempts=int(raw[19]),
+            sad_candidates=int(raw[20]),detect_cells=int(raw[21]),added=int(raw[22]),
+            ref_count=int(raw[23]),projected=int(raw[24]),
+            klt_eig_reject=int(raw[25]),klt_fail=int(raw[26]),
+            fb_reject=int(raw[27]),sad_fail=int(raw[28]),
+            fast_candidates=int(raw[29]),weak_candidates=int(raw[30]),
+            new_prev_count=int(raw[31]),new_prev_survived=int(raw[32]))
 
     def accept_variance(self, motion, variance):
         self.previous_variance = variance
@@ -234,4 +253,6 @@ def native_settings():
         C.KEYFRAME_HEIGHT_RATIO,C.KEYFRAME_ROTATION_RAD,C.FEATURE_TOPUP_RATIO,
         C.KLT_MIN_EIGENVALUE,C.KEYFRAME_REFRESH_INLIER_RATIO,
         C.FEATURE_TOPUP_CELLS,C.FEATURE_TOPUP_POINTS,C.KEYFRAME_CHECK_INTERVAL,
-        C.TEMPLATE_WARP_ANGLE_RAD,C.TEMPLATE_WARP_HEIGHT_RATIO,C.SAD_UNIQUENESS_RATIO))
+        C.TEMPLATE_WARP_ANGLE_RAD,C.TEMPLATE_WARP_HEIGHT_RATIO,C.SAD_UNIQUENESS_RATIO,
+        C.FEATURE_CELL_MAX_POINTS,C.FEATURE_MIN_DISTANCE_PX,C.WEAK_CORNER_STRIDE_PX,
+        C.INIT_FULL_SCAN_INTERVAL))

@@ -202,16 +202,26 @@ static int sad_search(vo_context_t *c,const uint8_t *im,size_t stride,
 }
 static int track_point(vo_context_t *c,const uint8_t *ref,const uint8_t *im,size_t stride,
                        float ru,float rv,float *uv,const float *inverse,float radius,float *weight) {
-    if(!template_patch(c,c->patch,ref,VO_WIDTH,ru,rv,inverse)) return 0;
+    if(!template_patch(c,c->patch,ref,VO_WIDTH,ru,rv,inverse)) {
+        c->output[O_KLT_FAIL]+=1;return 0;
+    }
     float u=uv[0],v=uv[1],error=0,fb=0;
     int success=klt(c,c->patch,im,stride,&u,&v,&error);
-    if(success<0) return 0; /* aperture/flat template: searching cannot fix it */
+    if(success<0) {
+        c->output[O_KLT_EIG_REJECT]+=1;return 0;
+    } /* aperture/flat template: searching cannot fix it */
     if(success!=1 || !backward(c,im,stride,ref,u,v,ru,rv,inverse,&fb)) {
         int bx,by;
-        if(!sad_search(c,im,stride,uv[0],uv[1],radius,&bx,&by)) return 0;
+        if(!sad_search(c,im,stride,uv[0],uv[1],radius,&bx,&by)) {
+            c->output[O_SAD_FAIL]+=1;return 0;
+        }
         u=(float)bx;v=(float)by;
-        if(klt(c,c->patch,im,stride,&u,&v,&error)!=1 ||
-           !backward(c,im,stride,ref,u,v,ru,rv,inverse,&fb)) return 0;
+        if(klt(c,c->patch,im,stride,&u,&v,&error)!=1) {
+            c->output[O_KLT_FAIL]+=1;return 0;
+        }
+        if(!backward(c,im,stride,ref,u,v,ru,rv,inverse,&fb)) {
+            c->output[O_FB_REJECT]+=1;return 0;
+        }
     }
     *weight=1.0f/(1.0f+(error/P(c,KLT_ERROR))*(error/P(c,KLT_ERROR))+
                   (fb/P(c,FB))*(fb/P(c,FB)));
@@ -237,55 +247,164 @@ static int fast_score(const uint8_t *im,size_t stride,int x,int y,int threshold)
     }
     return score>threshold?score:0;
 }
-/* Bounded 6x4 grid refill. Full scan only when no reference exists; low
- * texture never causes a repeated unbounded scan during measured tracking. */
+/* The same demeaned 8x8 structure tensor that the KLT uses. Testing the
+ * positive-semidefinite threshold first avoids a square root at most grid
+ * samples on a featureless floor. */
+static float corner_eigen(const uint8_t *im,size_t stride,int x,int y,float floor_value) {
+    float sx=0,sy=0,xx=0,xy=0,yy=0;
+    for(int py=-4;py<4;++py) for(int px=-4;px<4;++px) {
+        const uint8_t *p=im+(size_t)(y+py)*stride+(size_t)(x+px);
+        float gx=.5f*((float)p[1]-(float)p[-1]);
+        float gy=.5f*((float)p[stride]-(float)p[-(ptrdiff_t)stride]);
+        sx+=gx;sy+=gy;xx+=gx*gx;xy+=gx*gy;yy+=gy*gy;
+    }
+    xx-=sx*sx/64;xy-=sx*sy/64;yy-=sy*sy/64;
+    float limit=64*floor_value;
+    if(xx<limit || yy<limit || (xx-limit)*(yy-limit)<xy*xy) return 0;
+    return .5f*(xx+yy-sqrtf(MAX(0,(xx-yy)*(xx-yy)+4*xy*xy)))/64;
+}
+/* MODE2-only sampled diagnostics. Each 6x4 cell is sampled on a four-pixel
+ * lattice; the camera frame and the normal VO step remain untouched. */
+void vo_image_metrics(const uint8_t *im,size_t stride,float min_eigenvalue,
+                      float out[VO_IMAGE_METRICS]) {
+    for(int i=0;i<VO_IMAGE_METRICS;++i) out[i]=0;
+    if(!im || stride<VO_WIDTH || !isfinite(min_eigenvalue) || min_eigenvalue<=0) return;
+    float sx[24]={0},sy[24]={0},xx[24]={0},xy[24]={0},yy[24]={0};
+    int samples[24]={0},saturated[24]={0},total=0,sat_total=0;
+    float gsx=0,gsy=0,gxx=0,gxy=0,gyy=0;
+    for(int y=4;y<VO_HEIGHT-4;y+=4) for(int x=4;x<VO_WIDTH-4;x+=4) {
+        int cell=(y*4/VO_HEIGHT)*6+x*6/VO_WIDTH;
+        const uint8_t *p=im+(size_t)y*stride+(size_t)x;
+        int sat=*p>=250;float gx=.5f*((float)p[1]-(float)p[-1]);
+        float gy=.5f*((float)p[stride]-(float)p[-(ptrdiff_t)stride]);
+        ++samples[cell];saturated[cell]+=sat;++total;sat_total+=sat;
+        sx[cell]+=gx;sy[cell]+=gy;xx[cell]+=gx*gx;
+        xy[cell]+=gx*gy;yy[cell]+=gy*gy;
+        gsx+=gx;gsy+=gy;gxx+=gx*gx;gxy+=gx*gy;gyy+=gy*gy;
+    }
+    uint32_t sat_mask=0,good_mask=0;int good=0;
+    for(int i=0;i<24;++i) {
+        if(!samples[i]) continue;
+        if(saturated[i]*20>=samples[i]) sat_mask|=(uint32_t)1<<i;
+        float inv=1.0f/samples[i];
+        float a=xx[i]-sx[i]*sx[i]*inv,b=xy[i]-sx[i]*sy[i]*inv;
+        float d=yy[i]-sy[i]*sy[i]*inv;
+        float eigen=.5f*(a+d-sqrtf(MAX(0,(a-d)*(a-d)+4*b*b)))*inv;
+        if(eigen>=min_eigenvalue) {good_mask|=(uint32_t)1<<i;++good;}
+    }
+    float inv=1.0f/MAX(total,1);
+    float a=gxx-gsx*gsx*inv,b=gxy-gsx*gsy*inv,d=gyy-gsy*gsy*inv;
+    out[0]=(float)sat_total*inv;out[1]=(float)sat_mask;
+    out[2]=.5f*(a+d-sqrtf(MAX(0,(a-d)*(a-d)+4*b*b)))*inv;
+    out[3]=(float)good;out[4]=(float)good_mask;
+}
+static float distance2(float ax,float ay,float bx,float by) {
+    float dx=ax-bx,dy=ay-by;return dx*dx+dy*dy;
+}
+static int near_current(const vo_context_t *c,int count,float x,float y,float radius2) {
+    for(int i=0;i<count;++i)
+        if(distance2(c->current[i].x,c->current[i].y,x,y)<radius2) return 1;
+    return 0;
+}
+static void offer_point(vo_point_t *pool,int *used,int capacity,vo_point_t point,float radius2) {
+    int close=-1;
+    for(int i=0;i<*used;++i) if(distance2(pool[i].x,pool[i].y,point.x,point.y)<radius2) {
+        close=i;break;
+    }
+    if(close>=0) {
+        if(point.score<=pool[close].score) return;
+        for(int i=0;i<*used;++i) if(i!=close &&
+                distance2(pool[i].x,pool[i].y,point.x,point.y)<radius2) return;
+        pool[close]=point;return;
+    }
+    if(*used<capacity) {pool[(*used)++]=point;return;}
+    int weakest=0;
+    for(int i=1;i<*used;++i) if(pool[i].score<pool[weakest].score) weakest=i;
+    if(point.score>pool[weakest].score) pool[weakest]=point;
+}
+static int take_best(vo_context_t *c,vo_point_t *pool,int *used,int count,float radius2) {
+    while(*used) {
+        int best=0;
+        for(int i=1;i<*used;++i) if(pool[i].score>pool[best].score) best=i;
+        vo_point_t p=pool[best];pool[best]=pool[--*used];
+        if(near_current(c,count,p.x,p.y,radius2)) continue;
+        c->current[count]=p;c->current_fresh[count]=1;
+        return count+1;
+    }
+    return count;
+}
+/* A bounded 6x4 scan, with coverage first and at most two extra points per
+ * textured cell. FAST shortlists are checked against the KLT tensor; weak
+ * two-dimensional texture is sampled only when the shortlist is insufficient. */
 static int replenish(vo_context_t *c,const uint8_t *im,size_t stride,int count,int full) {
     uint32_t start=tick(c);
-    int limit=(int)P(c,FEATURES),quota=(limit+23)/24,initial=count;
+    int limit=(int)P(c,FEATURES),initial=count,cap=(int)P(c,CELL_MAX_POINTS);
     int cells=full?24:(int)P(c,TOPUP_CELLS);
     int additions=full?limit:(int)P(c,TOPUP_POINTS),counts[24]={0};
-    int offset[16];
+    int offset[16],selected[24],selected_count=0;
+    vo_point_t candidates[24][3];int available[24]={0};
+    float spacing2=P(c,MIN_DISTANCE)*P(c,MIN_DISTANCE);
     static const int8_t dx[16]={0,1,2,3,3,3,2,1,0,-1,-2,-3,-3,-3,-2,-1};
     static const int8_t dy[16]={3,3,2,1,0,-1,-2,-3,-3,-3,-2,-1,0,1,2,3};
     for(int i=0;i<16;++i) offset[i]=dy[i]*(int)stride+dx[i];
     for(int i=0;i<count;++i) {
-        int x=MIN(5,(int)(c->current[i].x*6/VO_WIDTH)),y=MIN(3,(int)(c->current[i].y*4/VO_HEIGHT));
+        int x=MIN(5,(int)(c->current[i].x*6/VO_WIDTH));
+        int y=MIN(3,(int)(c->current[i].y*4/VO_HEIGHT));
         counts[6*y+x]++;
     }
-    int scanned=0,begin=c->grid_cursor;
-    for(int visited=0;visited<24 && scanned<cells && count<limit && count-initial<additions;++visited) {
+    int begin=c->grid_cursor;
+    for(int visited=0;visited<24 && selected_count<cells && count<limit;++visited) {
         int grid=(begin+visited)%24;c->grid_cursor=(grid+1)%24;
-        if(counts[grid]>=quota) continue;
-        ++scanned;
-        vo_point_t candidates[3]={{0}};
+        if(counts[grid]>=cap) continue;
+        selected[selected_count++]=grid;
+        vo_point_t fast[8];int fast_count=0;
         int x0=MAX(12,(grid%6)*VO_WIDTH/6),x1=MIN(VO_WIDTH-12,(grid%6+1)*VO_WIDTH/6);
         int y0=MAX(12,(grid/6)*VO_HEIGHT/4),y1=MIN(VO_HEIGHT-12,(grid/6+1)*VO_HEIGHT/4);
         for(int y=y0;y<y1;++y) for(int x=x0;x<x1;++x) {
             if(!vo_fast_test(im+(size_t)y*stride+(size_t)x,offset,(int)P(c,FAST))) continue;
             int score=fast_score(im,stride,x,y,(int)P(c,FAST));
             if(score<=0) continue;
-            int close=0;
-            for(int i=0;i<count;++i) if(fabsf(c->current[i].x-x)<10 && fabsf(c->current[i].y-y)<10) {close=1;break;}
-            if(close) continue;
-            for(int k=0;k<3;++k) {
-                if(candidates[k].score && fabsf(candidates[k].x-x)<10 && fabsf(candidates[k].y-y)<10) {
-                    if(score>candidates[k].score) candidates[k]=(vo_point_t){(float)x,(float)y,(float)score};
-                    close=1;break;
-                }
-            }
-            if(close) continue;
-            int weakest=0;
-            for(int k=1;k<3;++k) if(candidates[k].score<candidates[weakest].score) weakest=k;
-            if(score>candidates[weakest].score) candidates[weakest]=(vo_point_t){(float)x,(float)y,(float)score};
+            c->output[O_FAST_CANDIDATES]+=1;
+            if(near_current(c,count,(float)x,(float)y,spacing2)) continue;
+            offer_point(fast,&fast_count,8,(vo_point_t){(float)x,(float)y,(float)score},spacing2);
         }
-        while(counts[grid]<quota && count<limit && count-initial<additions) {
-            int best=0;
-            for(int k=1;k<3;++k) if(candidates[k].score>candidates[best].score) best=k;
-            if(!candidates[best].score) break;
-            c->current[count++]=candidates[best];candidates[best].score=0;counts[grid]++;
+        for(int i=0;i<fast_count;++i) {
+            int x=(int)fast[i].x,y=(int)fast[i].y;
+            float eigen=corner_eigen(im,stride,x,y,P(c,MIN_EIG));
+            if(eigen>=P(c,MIN_EIG))
+                offer_point(candidates[grid],&available[grid],3,
+                    (vo_point_t){(float)x,(float)y,eigen},spacing2);
+        }
+        if(available[grid]<MIN(3,cap-counts[grid])) {
+            int step=(int)P(c,WEAK_STRIDE);
+            for(int y=y0;y<y1;y+=step) for(int x=x0;x<x1;x+=step) {
+                if(near_current(c,count,(float)x,(float)y,spacing2)) continue;
+                float eigen=corner_eigen(im,stride,x,y,P(c,MIN_EIG));
+                if(eigen<P(c,MIN_EIG)) continue;
+                c->output[O_WEAK_CANDIDATES]+=1;
+                offer_point(candidates[grid],&available[grid],3,
+                    (vo_point_t){(float)x,(float)y,eigen},spacing2);
+            }
         }
     }
-    c->output[O_DETECT_CELLS]+=(float)scanned;c->output[O_ADDED]+=(float)(count-initial);
+    /* The first pass cannot spend the four-point top-up budget in one cell. */
+    for(int pass=0;pass<2 && count<limit && count-initial<additions;++pass)
+        for(int i=0;i<selected_count && count<limit && count-initial<additions;++i) {
+            int grid=selected[i];
+            if(pass==0) {
+                if(counts[grid]) continue;
+                int next=take_best(c,candidates[grid],&available[grid],count,spacing2);
+                if(next>count) {count=next;counts[grid]++;}
+            } else {
+                while(counts[grid]<cap && count<limit && count-initial<additions) {
+                    int next=take_best(c,candidates[grid],&available[grid],count,spacing2);
+                    if(next==count) break;
+                    count=next;counts[grid]++;
+                }
+            }
+        }
+    c->output[O_DETECT_CELLS]+=(float)selected_count;
+    c->output[O_ADDED]+=(float)(count-initial);
     phase(c,T_DETECT,start);return count;
 }
 static int add_pair(vo_context_t *c,int n,const float *rm,const float *m,
@@ -361,17 +480,29 @@ static int fit_impl(vo_context_t *c,int n,const float *m) {
     int count=classify(c,n,m,tx,ty,&cost,0),cells[9]={0},occupied=0;
     c->output[O_INLIERS]=(float)count;
     if(count<(int)P(c,INLIERS) || count<=n/2 || (float)count/n<P(c,RATIO)) return 0;
-    float vx=0,vy=0,w=0;
+    float vx=0,vy=0,w=0,effective=0;
+    int spatial_count[24]={0};
+    for(int i=0;i<n;++i) if(c->inlier[i]) {
+        vo_pair_t *q=&c->pairs[i];
+        int cx=MAX(0,MIN(5,(int)(q->bu*6/VO_WIDTH)));
+        int cy=MAX(0,MIN(3,(int)(q->bv*4/VO_HEIGHT)));
+        ++spatial_count[6*cy+cx];
+    }
     for(int i=0;i<n;++i) if(c->inlier[i]) {
         vo_pair_t *q=&c->pairs[i];cells[cell(q->bu,q->bv)]=1;
         float ex=q->ax-q->bx-tx,ey=q->ay-q->by-ty;
         vx+=q->weight*ex*ex;vy+=q->weight*ey*ey;w+=q->weight;
+        int cx=MAX(0,MIN(5,(int)(q->bu*6/VO_WIDTH)));
+        int cy=MAX(0,MIN(3,(int)(q->bv*4/VO_HEIGHT)));
+        int occupancy=spatial_count[6*cy+cx];
+        effective+=q->weight*MIN(1.0f,3.0f/occupancy);
     }
     for(int i=0;i<9;++i) occupied+=cells[i];
     c->output[O_DN]=tx;c->output[O_DE]=ty;
     c->output[O_CELLS]=(float)occupied;
     c->output[O_RATIO]=(float)count/n;c->output[O_RESIDUAL]=sqrtf(cost/count);
-    c->output[O_VAR_N]=vx/w;c->output[O_VAR_E]=vy/w;c->output[O_EFFECTIVE]=w;
+    c->output[O_VAR_N]=vx/w;c->output[O_VAR_E]=vy/w;
+    c->output[O_EFFECTIVE]=effective;c->output[O_MATCH_WEIGHT_SUM]=w;
     c->output[O_SPARSE]=(float)(count<=3);c->output[O_REASON]=VO_REASON_OK;
     return isfinite(tx) && isfinite(ty);
 }
@@ -390,14 +521,20 @@ static int track(vo_context_t *c,const vo_frame_t *ref,const uint8_t *rim,
                  const uint8_t *im,size_t stride,const float *m,const float *pred,float radius) {
     int n=0,affine=needs_affine(c,ref,m);
     c->output[O_ATTEMPTS]+=1;
+    c->output[O_REF_COUNT]=(float)ref->count;
+    if(ref==&c->previous)
+        for(int i=0;i<ref->count;++i) c->output[O_NEW_PREV_COUNT]+=ref->fresh[i]!=0;
     for(int i=0;i<ref->count;++i) {
         vo_point_t p=ref->points[i];float uv[2],inverse[4],ground_ref[2],weight=0;
         uint32_t start=tick(c);
         int valid=warp(c,ref,m,pred,p.x,p.y,uv,inverse,affine,ground_ref);
         phase(c,T_WARP,start);
         if(!valid) continue;
+        c->output[O_PROJECTED]+=1;
         if(!track_point(c,rim,im,stride,p.x,p.y,uv,inverse,radius,&weight)) continue;
-        n=add_pair(c,n,ref->meta,m,p.x,p.y,uv[0],uv[1],weight,ground_ref,inverse);
+        int next=add_pair(c,n,ref->meta,m,p.x,p.y,uv[0],uv[1],weight,ground_ref,inverse);
+        if(next>n && ref==&c->previous) c->output[O_NEW_PREV_SURVIVED]+=ref->fresh[i]!=0;
+        n=next;
     }
     if(!fit(c,n,m)) return 0;
     /* Sparse tracking needs a uniqueness check even when KLT converges. */
@@ -412,9 +549,11 @@ static int track(vo_context_t *c,const vo_frame_t *ref,const uint8_t *rim,
     return 1;
 }
 static void save_frame(vo_frame_t *f,uint8_t *dst,const uint8_t *im,size_t stride,
-                       const float *m,int64_t stamp,const vo_point_t *points,int count,const float *position) {
+                       const float *m,int64_t stamp,const vo_point_t *points,
+                       const uint8_t *fresh,int count,const float *position) {
     memcpy(f->meta,m,VO_META_FLOATS*sizeof(float));f->stamp=stamp;f->count=count;
     memcpy(f->position,position,2*sizeof(float));memcpy(f->points,points,(size_t)count*sizeof(vo_point_t));
+    memcpy(f->fresh,fresh,(size_t)count);
     for(size_t y=0;y<VO_HEIGHT;++y) memcpy(dst+y*VO_WIDTH,im+y*stride,VO_WIDTH);
 }
 static void commit(vo_context_t *c,const vo_frame_t *ref,int base,const uint8_t *im,
@@ -425,6 +564,7 @@ static void commit(vo_context_t *c,const vo_frame_t *ref,int base,const uint8_t 
     int count=0;
     for(int i=0;i<(int)c->output[O_MATCHES];++i) if(c->inlier[i]) {
         c->current[count++]=(vo_point_t){c->pairs[i].bu,c->pairs[i].bv,1};
+        c->current_fresh[count-1]=0;
     }
     int measured_count=count;
     if(count<P(c,FEATURES)*P(c,TOPUP)) count=replenish(c,im,stride,count,0);
@@ -438,11 +578,11 @@ static void commit(vo_context_t *c,const vo_frame_t *ref,int base,const uint8_t 
         rotation>P(c,KEY_ROTATION) || c->output[O_RATIO]<P(c,KEY_RATIO);
     uint32_t copy_start=tick(c);
     if(refresh) {
-        save_frame(&c->key,c->key_image,im,stride,m,stamp,c->current,count,position);
+        save_frame(&c->key,c->key_image,im,stride,m,stamp,c->current,c->current_fresh,count,position);
         c->refresh_key=0;
         ++c->key_id;c->output[O_KEY_CHANGED]=1;
     }
-    save_frame(&c->previous,c->previous_image,im,stride,m,stamp,c->current,count,position);
+    save_frame(&c->previous,c->previous_image,im,stride,m,stamp,c->current,c->current_fresh,count,position);
     phase(c,T_COPY,copy_start);
     c->output[O_KEY_ID]=(float)c->key_id;c->output[O_STATUS]=2;
 }
@@ -470,7 +610,11 @@ int vo_init(vo_context_t *c,const float *cfg) {
        P(c,TOPUP_CELLS)<1 || P(c,TOPUP_CELLS)>24 || P(c,TOPUP_POINTS)<0 ||
        P(c,TOPUP_POINTS)>VO_MAX_FEATURES || P(c,KEY_INTERVAL)<1 || P(c,KEY_INTERVAL)>1000 ||
        P(c,WARP_ANGLE)<=0 || P(c,WARP_HEIGHT)<=0 ||
-       P(c,UNIQUENESS)<=0 || P(c,UNIQUENESS)>=1) return 0;
+       P(c,UNIQUENESS)<=0 || P(c,UNIQUENESS)>=1 ||
+       P(c,CELL_MAX_POINTS)<1 || P(c,CELL_MAX_POINTS)>3 ||
+       P(c,MIN_DISTANCE)<1 || P(c,MIN_DISTANCE)>16 ||
+       P(c,WEAK_STRIDE)<1 || P(c,WEAK_STRIDE)>8 ||
+       P(c,INIT_FULL_INTERVAL)<1 || P(c,INIT_FULL_INTERVAL)>100) return 0;
     return 1;
 }
 void vo_reset(vo_context_t *c) {
@@ -487,12 +631,13 @@ void vo_step(vo_context_t *c,const uint8_t *im,size_t stride,const float *m,
         c->output[O_STATUS]=-2;c->output[O_REASON]=VO_REASON_INPUT;return;
     }
     if(!c->ready) {
-        int count=replenish(c,im,stride,0,!c->initializing);float origin[2]={0,0};
-        c->initializing=1;
+        int full=(c->initializing%(int)P(c,INIT_FULL_INTERVAL))==0;
+        int count=replenish(c,im,stride,0,full);float origin[2]={0,0};
+        ++c->initializing;
         if(count<(int)P(c,MATCHES)) {c->output[O_STATUS]=-1;c->output[O_REASON]=VO_REASON_COUNT;return;}
         uint32_t start=tick(c);
-        save_frame(&c->key,c->key_image,im,stride,m,stamp,c->current,count,origin);
-        save_frame(&c->previous,c->previous_image,im,stride,m,stamp,c->current,count,origin);
+        save_frame(&c->key,c->key_image,im,stride,m,stamp,c->current,c->current_fresh,count,origin);
+        save_frame(&c->previous,c->previous_image,im,stride,m,stamp,c->current,c->current_fresh,count,origin);
         phase(c,T_COPY,start);
         c->ready=1;c->output[O_STATUS]=1;c->output[O_KEY_CHANGED]=1;c->output[O_REASON]=VO_REASON_INIT;return;
     }
@@ -505,7 +650,20 @@ void vo_step(vo_context_t *c,const uint8_t *im,size_t stride,const float *m,
     const vo_frame_t *ref=base?&c->previous:&c->key;
     const uint8_t *rim=base?c->previous_image:c->key_image;
     if(track(c,ref,rim,im,stride,m,pred,radius)) commit(c,ref,base,im,stride,m,stamp);
-    else if(!base) c->refresh_key=1; /* retire an unusable anchor after next real fix */
+    else {
+        if(!base) c->refresh_key=1; /* retire an unusable anchor after next real fix */
+        /* The failed image cannot become a reference. Refill the last known
+         * image so a later image has more viable points to try. */
+        int old=c->previous.count;
+        memcpy(c->current,c->previous.points,(size_t)old*sizeof(vo_point_t));
+        memcpy(c->current_fresh,c->previous.fresh,(size_t)old);
+        int count=replenish(c,c->previous_image,VO_WIDTH,old,0);
+        if(count>old) {
+            memcpy(c->previous.points,c->current,(size_t)count*sizeof(vo_point_t));
+            memcpy(c->previous.fresh,c->current_fresh,(size_t)count);
+            c->previous.count=count;
+        }
+    }
 }
 #ifdef VO_TESTING
 /* Host-only geometry seam: accepts observations, never fabricates images or

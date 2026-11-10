@@ -1,14 +1,17 @@
-"""MODE1轻量观察及总结；MODE2另存精简诊断，测量期间不写文件。"""
+"""MODE1轻量观察及总结；MODE2退出后保存汇总和限量逐帧诊断。"""
 MODE = 1
-DEBUG_VERSION = 'sparse-vo-3'
+DEBUG_VERSION = 'sparse-vo-4'
 RATE_WINDOW_US = 2000000
 EVENT_DISPLAY_INTERVAL_US = 1000000  # 状态变化摘要的最小间隔；不定时刷新，q立即查询
 LOG_DIRECTORY = None
 EVENT_BUFFER_SIZE = 16
+TRACE_CAPACITY = 512
+TRACE_RECORD_BYTES = 64
 
 import gc
 import math
 import os
+import struct
 import sys
 from array import array
 from algorithm import _us, _elapsed, euler_degrees
@@ -45,6 +48,15 @@ RECOVERY_STATES = ('POSE_RECOVERING', 'RANGE_RECOVERING')
 WARMUP_STATES = INITIAL_STATES+RECOVERY_STATES
 DISPLAY_STATES = ('初始化', '跟踪正常', '位置无效', '少点跟踪', '短时预测')
 EVENT_NAMES = ('连接变化', '同步变化', '进入失跟', '恢复跟踪', '轨迹重置', '测距异常', '程序异常')
+TRACE_REASON_NAMES = ('TRACKING', 'SPARSE_TRACKING', 'PREDICTING',
+    'POSE_RECOVERING', 'INITIALIZING', 'REINITIALIZING') + tuple(item[0] for item in FAILURES)
+TRACE_REASON_INDEX = {name: i for i, name in enumerate(TRACE_REASON_NAMES)}
+VISION_REASON_NAMES = ('OK', 'MATCH_COUNT', 'INLIER_RATIO', 'AMBIGUOUS_MATCH',
+                       'INPUT_INVALID', 'INITIALIZING', 'TRACK_FAILED')
+VISION_REASON_INDEX = {name: i for i, name in enumerate(VISION_REASON_NAMES)}
+TRACE_HEADER_FORMAT = '<IIffhhhhHhHfIHH'
+TRACE_BYTES_FORMAT = '<22B'
+assert struct.calcsize(TRACE_HEADER_FORMAT) + struct.calcsize(TRACE_BYTES_FORMAT) == TRACE_RECORD_BYTES
 
 
 def exception_text(exception):
@@ -159,6 +171,66 @@ class EventBuffer:
             yield '[%.3fs] %s：%s；重复=%d\n' % (stamp*.001, EVENT_NAMES[code], detail, self.repeats[slot])
 
 
+def trace_u8(value):
+    return 255 if value is None else max(0, min(254, int(value)))
+
+
+def trace_u16(value):
+    return 65535 if value is None else max(0, min(65534, int(value)))
+
+
+def trace_i16(value, scale=1):
+    return -32768 if value is None or not math.isfinite(value) else max(-32767, min(32767, int(value*scale+(.5 if value >= 0 else -.5))))
+
+
+def trace_float(value):
+    return float('nan') if value is None or not math.isfinite(value) else float(value)
+
+
+def trace_cell(value):
+    return '' if value == 255 else str(value)
+
+
+def trace_name(values, code):
+    return values[code] if code < len(values) else ''
+
+
+def trace_scaled(value, missing, divisor, digits):
+    return '' if value == missing else ('%.'+str(digits)+'f') % (value/divisor)
+
+
+def trace_decimal(value, digits=4):
+    return '' if not math.isfinite(value) else ('%.'+str(digits)+'f') % value
+
+
+class FrameTrace:
+    """Fixed 64-byte records; writes strings only after a MODE2 run ends."""
+    def __init__(self, capacity=TRACE_CAPACITY):
+        if capacity < 1:
+            raise ValueError('trace capacity must be positive')
+        self.capacity = capacity
+        self.buffer = bytearray(capacity*TRACE_RECORD_BYTES)
+        self.start = self.count = self.total = self.overwritten = 0
+
+    def reserve(self):
+        self.total += 1
+        if self.count < self.capacity:
+            slot = (self.start+self.count) % self.capacity
+            self.count += 1
+        else:
+            slot = self.start
+            self.start = (self.start+1) % self.capacity
+            self.overwritten += 1
+        return slot*TRACE_RECORD_BYTES
+
+    def rows(self):
+        for i in range(self.count):
+            slot = (self.start+i) % self.capacity
+            offset = slot*TRACE_RECORD_BYTES
+            yield (struct.unpack_from(TRACE_HEADER_FORMAT, self.buffer, offset) +
+                   struct.unpack_from(TRACE_BYTES_FORMAT, self.buffer, offset+42))
+
+
 def is_directory(path):
     try:
         return bool(os.stat(path)[0] & 0x4000)
@@ -249,6 +321,11 @@ class TestSession:
         self.last_heap_sample = -1000000
         self.sparse_frames = 0
         self.predicted_frames = 0
+        self.trace = FrameTrace() if self.timing else None
+        self.image_metrics = array('f', [0.0]*5) if self.timing else None
+        self.image_metrics_method = None
+        self.image_metrics_valid = False
+        self.frame_exposure_us = self.frame_gain_db = None
 
     def prepare(self, sensor, link, controller, capture, adapter, output):
         self.link = link
@@ -256,6 +333,7 @@ class TestSession:
         if self.console is None:
             self.console = Console()
         if self.timing:
+            self.image_metrics_method = getattr(controller.engine.core, 'image_metrics', None)
             self.rx_start = (getattr(link, 'attitude_received', 0), getattr(link, 'range_received', 0),
                              link.parser.bad_crc, link.sync_rtt_rejected)
             self.start_config = (C.IMAGE_WIDTH, C.IMAGE_HEIGHT, C.MAX_KEYPOINTS,
@@ -272,11 +350,26 @@ class TestSession:
         if self.start is None:
             self.start = self.end = self.rate_start = now
         if self.timing:
+            self.frame_exposure_us = self.frame_gain_db = None
+            self.image_metrics_valid = False
             for i in range(len(PHASES)):
                 self.values[i] = 0
             self.seen = 0
             self.frame_start = self.cursor = _us()
             self.active = True
+
+    def observe_image(self, image, sensor):
+        """Read camera state before the adapter changes settings for a later frame."""
+        if not self.timing:
+            return
+        try:
+            self.frame_exposure_us = sensor.get_exposure_us()
+            self.frame_gain_db = sensor.get_gain_db()
+        except (AttributeError, OSError):
+            self.frame_exposure_us = self.frame_gain_db = None
+        if self.image_metrics_method is not None:
+            self.image_metrics_method(image, self.image_metrics)
+            self.image_metrics_valid = True
 
     def record(self, name, duration):
         if self.timing and self.active:
@@ -395,6 +488,83 @@ class TestSession:
                 self.add_detail(2, result.get('residual_px'))
         return True
 
+    def record_trace(self, result):
+        if self.trace is None or result is None:
+            return
+        vision = result.get('vision')
+        has_vision = vision is not None
+        ref_count = vision.get('ref_count') if has_vision else None
+        ref_kind = trace_u8(vision.get('base')) if ref_count else 255
+        flags = (2 if result.get('approximate') else 0)
+        position = result.get('position')
+        if position is None:
+            north = east = float('nan')
+        elif self.origin is not None:
+            north, east = position[0]-self.origin[0], position[1]-self.origin[1]
+            flags |= 1  # N/E values are relative to the displayed origin.
+        else:
+            north, east = position
+        q = result.get('q')
+        try:
+            roll, pitch, yaw = euler_degrees(q) if q is not None else (None, None, None)
+        except (ValueError, TypeError):
+            roll = pitch = yaw = None
+        exposure = trace_u16(self.frame_exposure_us)
+        gain = trace_i16(self.frame_gain_db, 100)
+        if exposure != 65535:
+            flags |= 4
+        if gain != -32768:
+            flags |= 8
+        overexposure = 65535
+        overexposure_mask = 0
+        gradient = float('nan')
+        gradient_cells = 255
+        if self.image_metrics_valid:
+            m = self.image_metrics
+            overexposure = trace_u16(max(0.0, min(1.0, m[0]))*1000+0.5)
+            overexposure_mask = int(m[1]) & 0xFFFFFF
+            gradient = trace_float(m[2])
+            gradient_cells = trace_u8(m[3])
+            flags |= 16
+        if result.get('predicted') and result.get('valid'):
+            state = 2
+        elif result.get('measured') and result.get('valid'):
+            state = 1
+        elif result.get('measured'):
+            state = 3  # Native measurement awaiting pose confirmation.
+        else:
+            state = 0
+        failure = result.get('failure_reason')
+        quality = trace_u8(result.get('quality'))
+        offset = self.trace.reserve()
+        struct.pack_into(TRACE_HEADER_FORMAT, self.trace.buffer, offset,
+            max(0, min(0xFFFFFFFF, (result['timestamp_us']-self.start)//1000)),
+            max(0, min(0xFFFFFFFF, result.get('frame_sequence') or 0)),
+            north, east, trace_i16(roll, 100), trace_i16(pitch, 100),
+            trace_i16(yaw, 100), trace_i16(result.get('height'), 1000),
+            exposure, gain, overexposure, gradient, overexposure_mask,
+            trace_u16(vision.get('fast_candidates') if has_vision else None),
+            trace_u16(vision.get('weak_candidates') if has_vision else None))
+        struct.pack_into(TRACE_BYTES_FORMAT, self.trace.buffer, offset+42,
+            trace_u8(result.get('reset_counter')), trace_u8(self.origin_id), state,
+            TRACE_REASON_INDEX.get(result.get('reason'), 255),
+            FAILURE_INDEX.get(failure, 255), quality, ref_kind,
+            trace_u8(ref_count),
+            trace_u8(vision.get('projected') if has_vision else None),
+            trace_u8(result.get('matches') if has_vision else None),
+            trace_u8(result.get('inliers') if has_vision else None),
+            trace_u8(vision.get('added') if has_vision else None),
+            trace_u8(vision.get('klt_eig_reject') if has_vision else None),
+            trace_u8(vision.get('klt_fail') if has_vision else None),
+            trace_u8(vision.get('fb_reject') if has_vision else None),
+            trace_u8(vision.get('sad_fail') if has_vision else None),
+            trace_u8(vision.get('new_prev_count') if ref_kind == 1 else None),
+            trace_u8(vision.get('new_prev_survived') if ref_kind == 1 else None),
+            gradient_cells,
+            trace_u8(vision.get('detect_cells') if has_vision else None),
+            flags,
+            VISION_REASON_INDEX.get(vision.get('vision_reason'), 255) if has_vision else 255)
+
     def update_rates(self, now):
         elapsed = now-self.rate_start
         if elapsed >= RATE_WINDOW_US:
@@ -481,6 +651,8 @@ class TestSession:
         try:
             return self.interact(result, now, new)
         finally:
+            if self.timing and new:
+                self.record_trace(result)
             self.finish_statistics(now, debug_start)
 
     def finish_statistics(self, now, debug_start):
@@ -586,6 +758,55 @@ class TestSession:
             self.events.total, self.events.count, self.events.overwritten))
         for line in self.events.lines():
             write(line)
+        write('\n逐帧诊断：总数=%d 保留=%d 覆盖=%d；时间为本次测试开始后的毫秒。'
+              'N/E在origin_id>0且position_relative=1时相对该原点，否则为VO原始坐标；'
+              '255/空白表示无测量。新点留存只统计上一帧参考，关键帧参考留空；'
+              '失跟帧的added_points表示补入旧参考图的点。\n' % (
+                  self.trace.total, self.trace.count, self.trace.overwritten))
+        write('frame_ms,sequence,reset_id,origin_id,position_relative,state,reason,vision_reason,'
+              'failure,quality,n_m,e_m,roll_deg,pitch_deg,yaw_deg,height_m,exposure_us,gain_db,'
+              'overexposed_fraction,overexposed_cell_mask_hex,gradient2d_min_eigen,'
+              'gradient_usable_cells,reference,reference_points,projected_points,warp_reject,'
+              'matches,inliers,fast_candidates,weak_candidates,added_points,scanned_cells,'
+              'finding_outcome,klt_eigen_reject,'
+              'klt_fail,forward_backward_reject,sad_fail,new_previous_points,'
+              'new_previous_survived,new_previous_retention\n')
+        states = ('lost', 'measured', 'predicted', 'pose_confirming')
+        for row in self.trace.rows():
+            flags = row[35]
+            retained = (trace_decimal(row[32]/row[31], 3)
+                        if row[21] == 1 and row[31] not in (0, 255) and row[32] != 255 else '')
+            if row[34] == 255 or row[26] == 255:
+                finding = ''
+            elif row[34] == 0:
+                finding = 'not_scanned'
+            elif row[26] > 0:
+                finding = 'added'
+            elif row[13] == 0 and row[14] == 0:
+                finding = 'no_2d_candidate'
+            else:
+                finding = 'candidates_not_added'
+            warp_reject = (row[22]-row[23]
+                           if row[22] != 255 and row[23] != 255 else '')
+            values = (
+                row[0], row[1], trace_cell(row[15]), trace_cell(row[16]), int(bool(flags & 1)),
+                trace_name(states, row[17]), trace_name(TRACE_REASON_NAMES, row[18]),
+                trace_name(VISION_REASON_NAMES, row[36]),
+                trace_name(tuple(item[0] for item in FAILURES), row[19]), trace_cell(row[20]),
+                trace_decimal(row[2]), trace_decimal(row[3]),
+                trace_scaled(row[4], -32768, 100, 2), trace_scaled(row[5], -32768, 100, 2),
+                trace_scaled(row[6], -32768, 100, 2), trace_scaled(row[7], -32768, 1000, 3),
+                trace_scaled(row[8], 65535, 1, 0), trace_scaled(row[9], -32768, 100, 2),
+                trace_scaled(row[10], 65535, 1000, 3),
+                ('%06X' % row[12]) if flags & 16 else '', trace_decimal(row[11], 3),
+                trace_cell(row[33]), ('previous' if row[21] == 1 else 'key' if row[21] == 0 else ''),
+                trace_cell(row[22]), trace_cell(row[23]), warp_reject,
+                trace_cell(row[24]), trace_cell(row[25]),
+                trace_cell(row[13]), trace_cell(row[14]), trace_cell(row[26]), trace_cell(row[34]),
+                finding,
+                trace_cell(row[27]), trace_cell(row[28]), trace_cell(row[29]), trace_cell(row[30]),
+                trace_cell(row[31]), trace_cell(row[32]), retained)
+            write(','.join(str(value) for value in values)+'\n')
         write('最终报告保存发生在测量结束后；运行中无文件写入。日志完成\n')
 
     def close(self, reason='x正常结束', error=None):

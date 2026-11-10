@@ -91,6 +91,10 @@ ATTITUDE_RESET_MARGIN_RAD = 0.20
 # ---------- 原生FAST / 稀疏KLT / 姿态高度辅助二维平移 ----------
 MAX_KEYPOINTS = 24                 # 正常目标24；原生容量64，最低2个可靠点可继续跟踪
 FAST_THRESHOLD = 15               # OpenMV v4.5.9 FAST-9灰度差阈值，无ORB描述子
+FEATURE_CELL_MAX_POINTS = 3        # 6x4网格先均匀选点，再允许有纹理格最多3点
+FEATURE_MIN_DISTANCE_PX = 6        # px；候选点中心欧氏最小间距，较小值增加密集纹理点但提高相关性
+WEAK_CORNER_STRIDE_PX = 3          # px；FAST不足时二维梯度后备候选的扫描步长
+INIT_FULL_SCAN_INTERVAL = 4        # 帧；初始化未得到两点时定期全图重扫
 FEATURE_TOPUP_RATIO = 0.75         # 少于目标的75%才补点；24点目标对应低于18点
 FEATURE_TOPUP_CELLS = 6            # 每帧最多扫描缺点网格数，轮转覆盖6x4网格
 FEATURE_TOPUP_POINTS = 4           # 每帧最多新增4点；首张初始化图可全网格检测

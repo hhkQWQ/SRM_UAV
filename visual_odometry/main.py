@@ -33,6 +33,9 @@ def validate_config():
             or not 1 <= C.KEYFRAME_CHECK_INTERVAL <= 1000 or C.SPARSE_MAX_INLIERS != 3 or not .5 < C.MIN_INLIER_RATIO <= 1
             or not 0 < C.SAD_UNIQUENESS_RATIO < 1):
         raise ValueError("invalid tracking work budget/consensus")
+    if (not 1 <= C.FEATURE_CELL_MAX_POINTS <= 3 or not 3 <= C.FEATURE_MIN_DISTANCE_PX <= 12
+            or not 1 <= C.WEAK_CORNER_STRIDE_PX <= 8 or not 1 <= C.INIT_FULL_SCAN_INTERVAL <= 100):
+        raise ValueError("invalid weak-feature detection settings")
     if (not 0 < C.TRACK_HOLD_US < C.LOST_RESET_US or not 2 <= C.PREDICTION_HISTORY_SIZE <= 16
             or not 1 <= C.CONFIDENCE_FULL_POINTS <= 64 or not 1 <= C.CONFIDENCE_FULL_CELLS <= 9
             or not math.isfinite(C.CONFIDENCE_SIGMA0_M) or C.CONFIDENCE_SIGMA0_M <= 0
@@ -213,6 +216,8 @@ def run(observer=None):
         process_start = link.clock.now_us()
         gyro = link.attitudes[-1][2] if link.attitudes else (0.0, 0.0, 0.0)
         pixel_speed = controller.engine.predicted_pixel_speed(last_height, stamp)
+        if probe is not None and hasattr(probe, 'observe_image'):
+            probe.observe_image(image, sensor)
         statistics = camera_adapter.update(image, process_start, gyro, pixel_speed)
         if probe is not None:
             probe.mark("capture")

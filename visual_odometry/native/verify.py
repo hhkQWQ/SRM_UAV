@@ -64,6 +64,7 @@ def build():
     lib.vo_get_timings.restype = T.POINTER(T.c_uint32)
     lib.vo_get_result.argtypes = [T.c_void_p]
     lib.vo_get_result.restype = FP
+    lib.vo_image_metrics.argtypes = [T.c_void_p, T.c_size_t, F, FP]
     return lib
 
 
@@ -101,6 +102,12 @@ class HostCore:
 
     def limit(self, count, topup=0):
         LIB.vo_test_limit(self.ctx, count, topup)
+
+    def image_metrics(self, image, out):
+        data = (T.c_uint8*len(image)).from_buffer(image)
+        metrics = (F*5)()
+        LIB.vo_image_metrics(data, 320, F(C.KLT_MIN_EIGENVALUE), metrics)
+        for i in range(5): out[i] = metrics[i]
 
 
 class Image(bytearray):
@@ -428,6 +435,7 @@ def check_confidence_prediction():
     assert good(.001)-good(.001,cells=0)<=10
     assert good(.001)-good(.001,ratio=0)<=10
     assert good(.001)-good(.001,cells=0,ratio=0)<=20
+    assert confidence((.001,.001),6,2,1,3,6) > confidence((.001,.001),6,2,1,3,3)
     assert confidence((float('nan'),0),16,6,1,16)==0
     assert confidence((0,0),1,6,1,1)==0
     saved=C.CONFIDENCE_SIGMA0_M
@@ -593,6 +601,89 @@ def check_work_bounds():
     print('PASS: refill/search limits, no large-motion false fix, bounded empty initialization and opt-in native timing')
 
 
+def check_weak_features_and_metrics():
+    from array import array
+    core=HostCore(A.native_settings())
+    metrics=array('f',[0]*5)
+    core.image_metrics(Image([128])*(WIDTH*HEIGHT),metrics)
+    assert metrics[0]==0 and metrics[2]==0 and metrics[3]==0,metrics
+    core.image_metrics(Image([255])*(WIDTH*HEIGHT),metrics)
+    assert metrics[0]==1 and int(metrics[1])==0xFFFFFF and metrics[3]==0,metrics
+    # Smooth crossed gradients have two-dimensional texture but seldom satisfy
+    # FAST-9's hard intensity threshold. Parallel lines remain aperture-limited.
+    weak=Image(max(0,min(255,round(128+10*math.sin(x*.48)+10*math.sin(y*.57))))
+               for y in range(HEIGHT) for x in range(WIDTH))
+    core.image_metrics(weak,metrics)
+    assert metrics[2]>=C.KLT_MIN_EIGENVALUE and metrics[3]>0,metrics
+    engine=A.FeatureEngine()
+    initial=engine.process(weak,(1,0,0,0),1.5,(0,0,0),100000)
+    assert initial['status']==1 and initial['weak_candidates']>0,initial
+    repeat=engine.process(weak,(1,0,0,0),1.5,(0,0,0),133333)
+    assert repeat['ref_count']>0 and repeat['new_prev_count']==repeat['ref_count'],repeat
+    assert repeat['new_prev_survived']<=repeat['new_prev_count'],repeat
+    lines=Image(max(0,min(255,round(128+20*math.sin(x*.48))))
+                for y in range(HEIGHT) for x in range(WIDTH))
+    engine=A.FeatureEngine()
+    initial=engine.process(lines,(1,0,0,0),1.5,(0,0,0),100000)
+    assert initial['status']==-1 and initial['added']==0,initial
+    # Dense interest in one 6x4 cell cannot consume the whole feature budget.
+    local=Image(128 if not (60<=x<100 and 70<=y<110) else hash_value(x,y)
+                for y in range(HEIGHT) for x in range(WIDTH))
+    engine=A.FeatureEngine()
+    initial=engine.process(local,(1,0,0,0),1.5,(0,0,0),100000)
+    assert initial['added']<=C.FEATURE_CELL_MAX_POINTS,initial
+    engine=A.FeatureEngine()
+    assert engine.process(render(),(1,0,0,0),1.5,(0,0,0),100000)['status']==1
+    engine.core.limit(1,4)
+    failed=engine.process(Image(WIDTH*HEIGHT),(1,0,0,0),1.5,(0,0,0),133333)
+    assert failed['status']==0 and 0<failed['added']<=4,failed
+    recovered=engine.process(render(),(1,0,0,0),1.5,(0,0,0),166666)
+    assert recovered['ref_count']>1 and recovered['new_prev_count']>0,recovered
+    print('PASS: sampled exposure/2D-gradient metrics, weak crossed texture, aperture rejection, per-cell feature cap and new-point accounting')
+
+
+def check_frame_trace():
+    from test import FrameTrace,TestSession
+    session=TestSession(2)
+    session.trace=FrameTrace(2)
+    session.start=100000
+    session.origin=(1.0,2.0)
+    session.origin_id=1
+    session.image_metrics_valid=True
+    for i,value in enumerate((.125,3.0,5.5,4.0,7.0)):
+        session.image_metrics[i]=value
+    session.frame_exposure_us=1200
+    session.frame_gain_db=6.25
+    vision=dict(base=1,ref_count=5,projected=4,added=2,detect_cells=6,
+                klt_eig_reject=1,klt_fail=0,fb_reject=0,sad_fail=1,
+                fast_candidates=12,weak_candidates=8,new_prev_count=2,
+                new_prev_survived=1,vision_reason='OK')
+    for i in range(3):
+        session.record_trace(dict(timestamp_us=100000+33333*i,frame_sequence=i+1,
+            position=(1.2,2.3),q=(1,0,0,0),height=.7,valid=True,measured=True,
+            predicted=False,approximate=False,reset_counter=0,reason='TRACKING',
+            quality=80,matches=4,inliers=3,vision=vision))
+    assert (session.trace.total,session.trace.count,session.trace.overwritten)==(3,2,1)
+    rows=list(session.trace.rows())
+    assert [row[1] for row in rows]==[2,3] and rows[0][31:33]==(2,1),rows
+    assert abs(rows[0][2]-.2)<1e-5 and rows[0][8]==1200 and rows[0][10]==125,rows[0]
+    session.start_config=()
+    session.rx_start=(0,0,0,0)
+    session.common_lines=lambda *args: ()
+    session.link=types.SimpleNamespace(attitude_received=0,range_received=0,
+        parser=types.SimpleNamespace(bad_crc=0),sync_rtt_rejected=0)
+    output=[]
+    session.report(output.append,{'seconds':1},'x',None)
+    report=''.join(output)
+    assert '逐帧诊断：总数=3 保留=2 覆盖=1' in report
+    assert 'new_previous_retention' in report and ',0.500\n' in report,report[-250:]
+    lines=report.splitlines()
+    header=next(line for line in lines if line.startswith('frame_ms,sequence,'))
+    records=[line for line in lines if line.startswith(('33,2,','66,3,'))]
+    assert len(records)==2 and all(len(line.split(','))==len(header.split(',')) for line in records)
+    print('PASS: fixed-capacity chronological MODE2 trace, exposure/gradient serialization and retention report')
+
+
 def check_micropython(executable):
     folder = ROOT/'native'/'_build'
     (folder/'reference.gray').write_bytes(render())
@@ -602,13 +693,13 @@ import sys
 sys.path.insert(0, %r)
 from array import array
 import rm_vo, algorithm as A, config as C
-assert rm_vo.ABI_VERSION==3 and rm_vo.RESULT_FLOATS==23
+assert rm_vo.ABI_VERSION==4 and rm_vo.RESULT_FLOATS==34
 core=rm_vo.Core(A.native_settings())
 core.profile(True)
 meta=array('f', C.R_BC+(0,0,0,1.5))
 stamp=array('I',(100000,1))
 prediction=array('f',(0,0,8))
-out=array('f',[0]*23)
+out=array('f',[0]*A.RESULT_FLOATS)
 with open(%r,'rb') as f: reference=bytearray(f.read())
 with open(%r,'rb') as f: shifted=bytearray(f.read())
 core.step(reference,meta,stamp,prediction,out)
@@ -617,7 +708,10 @@ reference[:]=bytes(len(reference))
 stamp[0]=133333
 core.step(shifted,meta,stamp,prediction,out)
 assert out[0]==2 and abs(out[1]-.012)<.006 and abs(out[2]+.009)<.006,out
-assert out[19]==1 and len(out)==23,out
+assert out[19]==1 and len(out)==34,out
+metrics=array('f',[0]*5)
+core.image_metrics(shifted,metrics)
+assert metrics[2]>0 and metrics[3]>0,metrics
 stamp[0]=166666;stamp[1]=0
 core.step(shifted,meta,stamp,prediction,out)
 assert out[0]==-2,out
@@ -636,7 +730,7 @@ core.reset()
 stamp[0]=166666
 core.step(shifted,meta,stamp,prediction,out)
 assert out[0]==1
-print('PASS: actual MicroPython ABI3 binding, uint64 time, buffers, native timings and reset')
+print('PASS: actual MicroPython ABI4 binding, uint64 time, buffers, metrics, native timings and reset')
 class Image:
     def __init__(self,data): self.data=data
     def width(self): return 320
@@ -654,6 +748,7 @@ class BorrowedBuffer:
     def profile(self,enabled): self.core.profile(enabled)
     def timings(self,out): self.core.timings(out)
     def step(self,image,*args): self.core.step(image.data,*args)
+    def image_metrics(self,image,out): self.core.image_metrics(image.data,out)
 class Probe:
     count=0
     def native(self,values): self.count+=1
@@ -681,7 +776,7 @@ print('PASS: actual MicroPython temporal regression, prediction provenance and u
 
 if __name__=='__main__':
     LIB=build()
-    sys.modules['rm_vo']=types.SimpleNamespace(Core=HostCore,ABI_VERSION=3)
+    sys.modules['rm_vo']=types.SimpleNamespace(Core=HostCore,ABI_VERSION=4,RESULT_FLOATS=34)
     sys.modules['image']=types.SimpleNamespace(GRAYSCALE=1,CORNER_FAST=0,CORNER_AGAST=1)
     for p in ROOT.glob('*.py'):
         compile(p.read_text(encoding='utf-8'),str(p),'exec')
@@ -698,6 +793,8 @@ if __name__=='__main__':
     check_confidence_prediction()
     check_prediction_lifecycle()
     check_work_bounds()
+    check_weak_features_and_metrics()
+    check_frame_trace()
     if '--micropython' in sys.argv:
         check_micropython(sys.argv[sys.argv.index('--micropython')+1])
     print('All PC checks passed. Hardware FPS/firmware build remain separate.')

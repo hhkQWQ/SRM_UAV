@@ -8,15 +8,17 @@ import algorithm as A
 from comm import History
 
 
-def confidence(variance, count, cells, ratio, effective):
+def confidence(variance, count, cells, ratio, effective, match_weight_sum=None):
     """唯一0~100工程评分；方差70%，点数/覆盖/匹配各10%。"""
     if count < 2 or not all(A.finite(v) and v >= 0 for v in variance):
         return 0
     sigma2 = C.CONFIDENCE_SIGMA0_M**2
     v = sigma2/(sigma2+max(variance))
-    n = min(1.0, count/C.CONFIDENCE_FULL_POINTS)
+    # 原始内点可能来自同一小片纹理；原生有效点数按6x4空间格折减。
+    n = min(1.0, max(0.0, effective)/C.CONFIDENCE_FULL_POINTS)
     c = max(0.0, min(1.0, cells/C.CONFIDENCE_FULL_CELLS))
-    m = max(0.0, min(1.0, ratio))*max(0.0, min(1.0, effective/count))
+    matching = effective if match_weight_sum is None else match_weight_sum
+    m = max(0.0, min(1.0, ratio))*max(0.0, min(1.0, matching/count))
     return max(0, min(100, int(100*(.70*v+.10*n+.10*c+.10*m)+.5)))
 
 
@@ -384,7 +386,8 @@ class VOController:
         # Unknown calibration is a shared output uncertainty, not a new
         # independent 10cm error to accumulate on every reference-chain edge.
         variance = tuple(v+(0.1**2 if approximate else 0.0) for v in reference_variance)
-        score_data = (count,motion['cells'],motion['ratio'],effective)
+        score_data = (count,motion['cells'],motion['ratio'],effective,
+                      motion.get('match_weight_sum', effective))
         quality = confidence(variance, *score_data)
         self.engine.accept_variance(motion, reference_variance)
         self.predictor.add(stamp, position)

@@ -11,15 +11,18 @@
 #define VO_MAX_FEATURES 64
 #define VO_PATCH 8
 #define VO_TEMPLATE 10
-#define VO_ABI_VERSION 3
+#define VO_ABI_VERSION 4
 #define VO_META_FLOATS 13 /* R_NC[9], camera lever arm in NED[3], camera height */
+#define VO_IMAGE_METRICS 5
 enum {
     V_FX, V_FY, V_CX, V_CY, V_K1, V_K2, V_P1, V_P2, V_K3,
     V_FEATURES, V_FAST, V_MATCHES, V_INLIERS, V_RATIO, V_RAY,
     V_GATE, V_SEARCH_MIN, V_SEARCH_MAX, V_KLT_ITERS, V_KLT_ERROR,
     V_FB, V_KEY_DISTANCE, V_KEY_HEIGHT, V_KEY_ROTATION,
     V_TOPUP, V_MIN_EIG, V_KEY_RATIO, V_TOPUP_CELLS, V_TOPUP_POINTS,
-    V_KEY_INTERVAL, V_WARP_ANGLE, V_WARP_HEIGHT, V_UNIQUENESS, VO_CONFIG_FLOATS
+    V_KEY_INTERVAL, V_WARP_ANGLE, V_WARP_HEIGHT, V_UNIQUENESS,
+    V_CELL_MAX_POINTS, V_MIN_DISTANCE, V_WEAK_STRIDE, V_INIT_FULL_INTERVAL,
+    VO_CONFIG_FLOATS
 };
 enum {
     O_STATUS, O_N, O_E, O_DN, O_DE, O_MATCHES, O_INLIERS,
@@ -27,6 +30,9 @@ enum {
     O_KEY_ID, O_KEY_CHANGED, O_BASE, O_REF_HEIGHT,
     O_SPARSE, O_REASON, O_EFFECTIVE, O_ATTEMPTS, O_SAD_TESTS,
     O_DETECT_CELLS, O_ADDED,
+    O_REF_COUNT, O_PROJECTED, O_KLT_EIG_REJECT, O_KLT_FAIL,
+    O_FB_REJECT, O_SAD_FAIL, O_FAST_CANDIDATES, O_WEAK_CANDIDATES,
+    O_NEW_PREV_COUNT, O_NEW_PREV_SURVIVED, O_MATCH_WEIGHT_SUM,
     VO_RESULT_FLOATS
 };
 enum { T_WARP, T_KLT, T_SAD, T_DETECT, T_FIT, T_COPY, VO_PHASES };
@@ -36,6 +42,7 @@ typedef struct {
     float meta[VO_META_FLOATS], position[2];
     int64_t stamp;
     vo_point_t points[VO_MAX_FEATURES];
+    uint8_t fresh[VO_MAX_FEATURES]; /* Newly detected in this reference image. */
     int count;
 } vo_frame_t;
 typedef struct {
@@ -52,6 +59,7 @@ typedef struct {
     /* Reused per-frame workspace; no allocation during step. */
     vo_pair_t pairs[VO_MAX_FEATURES];
     vo_point_t current[VO_MAX_FEATURES];
+    uint8_t current_fresh[VO_MAX_FEATURES];
     uint8_t inlier[VO_MAX_FEATURES];
     uint8_t patch[VO_TEMPLATE * VO_TEMPLATE];
     float gradient[2][VO_PATCH * VO_PATCH];
@@ -66,9 +74,14 @@ void vo_reset(vo_context_t *ctx);
 void vo_profile(vo_context_t *ctx, uint32_t (*clock_us)(void));
 /* prediction is absolute N/E, used ONLY for matching. radius is in QVGA px.
  * step status: 2 measured, 1 initialized (no measurement), 0 lost,
- * -1 insufficient features, -2 invalid input. No state commit on failure. */
+ * -1 insufficient features, -2 invalid input. Failure never commits a new
+ * pose or image; it may add points to the cached previous reference image. */
 void vo_step(vo_context_t *ctx, const uint8_t *image, size_t stride,
              const float *meta, int64_t stamp, const float *prediction, float radius);
+/* Sampled image diagnostics: saturated fraction, 6x4 saturation mask,
+ * global structure-tensor minimum eigenvalue, usable cell count and mask. */
+void vo_image_metrics(const uint8_t *image, size_t stride,
+                      float min_eigenvalue, float out[VO_IMAGE_METRICS]);
 size_t vo_context_bytes(void);
 const float *vo_get_result(const vo_context_t *ctx);
 const uint32_t *vo_get_timings(const vo_context_t *ctx);

@@ -59,11 +59,20 @@ static mp_obj_t timings(mp_obj_t self_in,mp_obj_t output) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(timings_obj,timings);
+static mp_obj_t image_metrics(mp_obj_t self_in,mp_obj_t image_in,mp_obj_t output) {
+    vo_obj_t *self=MP_OBJ_TO_PTR(self_in);
+    const uint8_t *image=buffer(image_in,VO_PIXELS,MP_BUFFER_READ,0);
+    float *out=buffer(output,VO_IMAGE_METRICS*sizeof(float),MP_BUFFER_WRITE,1);
+    vo_image_metrics(image,VO_WIDTH,self->core.cfg[V_MIN_EIG],out);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_3(image_metrics_obj,image_metrics);
 static const mp_rom_map_elem_t locals_table[]={
     {MP_ROM_QSTR(MP_QSTR_reset),MP_ROM_PTR(&reset_obj)},
     {MP_ROM_QSTR(MP_QSTR_step),MP_ROM_PTR(&step_obj)},
     {MP_ROM_QSTR(MP_QSTR_profile),MP_ROM_PTR(&profile_obj)},
     {MP_ROM_QSTR(MP_QSTR_timings),MP_ROM_PTR(&timings_obj)},
+    {MP_ROM_QSTR(MP_QSTR_image_metrics),MP_ROM_PTR(&image_metrics_obj)},
 };
 static MP_DEFINE_CONST_DICT(locals_dict,locals_table);
 static MP_DEFINE_CONST_OBJ_TYPE(vo_type,MP_QSTR_Core,MP_TYPE_FLAG_NONE,
