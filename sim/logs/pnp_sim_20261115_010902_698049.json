@@ -1,0 +1,105 @@
+{
+  "mode": "observe",
+  "algorithm_dir": "/home/hhkqwq/SRM_UAV/PnP",
+  "simulation_overrides": {
+    "R_BC": [
+      [
+        0.0,
+        -0.9999999953605743,
+        9.632679474766714e-05
+      ],
+      [
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        9.632679474766714e-05,
+        0.9999999953605743
+      ]
+    ],
+    "T_BC_M": [
+      0.0,
+      0.0,
+      0.14
+    ]
+  },
+  "detector_config": {
+    "LIGHT_EXTRACT_MODE": "GRAY",
+    "TARGET_COLOR": "ANY",
+    "LIGHT_L_MIN": 25,
+    "RED_THRESHOLD": [
+      10,
+      100,
+      20,
+      127,
+      -30,
+      127
+    ],
+    "BLUE_THRESHOLD": [
+      36,
+      100,
+      -60,
+      80,
+      -128,
+      0
+    ]
+  },
+  "processing_resolution": [
+    320,
+    240
+  ],
+  "ground_truth_policy": "metrics and labelled attitude assistance only; never a control position input",
+  "shadow_policy": "simulated ready/armed/offboard gates; diagnostic output only",
+  "options": {
+    "algorithm_dir": "/home/hhkqwq/SRM_UAV/PnP",
+    "px4_dir": "/home/hhkqwq/PX4-Autopilot",
+    "world": "pnp_pillar",
+    "model": "x500_mono_cam_down_0",
+    "image_topic": "/pnp/image_raw",
+    "camera_info_topic": "/pnp/camera_info",
+    "log_dir": "/home/hhkqwq/SRM_UAV/sim/logs",
+    "max_fps": null,
+    "opencv_threads": 2,
+    "mavlink_port": 14540,
+    "no_mavlink": false,
+    "truth_attitude": false,
+    "enable_control": false
+  },
+  "camera_calibration": {
+    "native_size": [
+      1280,
+      960
+    ],
+    "native_k": [
+      539.9363327026367,
+      0.0,
+      640.0,
+      0.0,
+      539.9363708496094,
+      480.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "native_d": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "processing_size": [
+      320,
+      240
+    ],
+    "processing_intrinsics": [
+      134.98408317565918,
+      134.98409271240234,
+      159.625,
+      119.625
+    ],
+    "resize": "INTER_AREA; pixel-center mapping"
+  }
+}
