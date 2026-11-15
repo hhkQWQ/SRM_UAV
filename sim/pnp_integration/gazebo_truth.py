@@ -1,4 +1,4 @@
-"""Time-aligned Gazebo truth for the stock PX4 X500 down-facing camera.
+"""Time-aligned Gazebo truth for the OpenMV-matched X500 camera mount.
 
 The camera's pixel coordinates are optical (right, down, forward). Gazebo's
 camera link is FLU; PX4 body coordinates are FRD and its local frame is NED.
@@ -17,9 +17,9 @@ import threading
 from typing import NamedTuple
 
 
-CAMERA_PITCH = 1.5707
 BASE_IN_MODEL = (0.0, 0.0, 0.24)
-CAMERA_IN_MODEL = (0.0, 0.0, 0.10)
+CAMERA_IN_MODEL = (0.14, 0.0, 0.20)
+CAMERA_ROTATION_IN_MODEL = ((0.0, 0.0, -1.0), (0.0, -1.0, 0.0), (-1.0, 0.0, 0.0))
 ENU_TO_NED = ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0))
 FRD_TO_FLU = ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
 OPTICAL_TO_SENSOR = ((0.0, 0.0, 1.0), (-1.0, 0.0, 0.0), (0.0, -1.0, 0.0))
@@ -122,15 +122,16 @@ def _minus(first, second):
     return tuple(a - b for a, b in zip(first, second))
 
 
-def camera_extrinsics():
-    """Return stock optical-to-base FRD rotation and translation."""
-    s, c = math.sin(CAMERA_PITCH), math.cos(CAMERA_PITCH)
-    return (((0.0, -s, c), (1.0, 0.0, 0.0), (0.0, c, s)),
-            (0.0, 0.0, 0.14))
+def camera_extrinsics(camera_position=CAMERA_IN_MODEL,
+                      camera_rotation=CAMERA_ROTATION_IN_MODEL):
+    """Return optical-to-base FRD placement, defaulting to original config.py."""
+    return (_mm(_mm(FRD_TO_FLU, camera_rotation), OPTICAL_TO_SENSOR),
+            _mv(FRD_TO_FLU, _minus(camera_position, BASE_IN_MODEL)))
 
 
 def compute_truth(model_position, model_quaternion, target_position=(5.0, 0.0, 1.5),
-                  velocity_enu=None):
+                  velocity_enu=None, *, camera_position=CAMERA_IN_MODEL,
+                  camera_rotation=CAMERA_ROTATION_IN_MODEL):
     """Compute optical and body-relative truth from a top-level model pose.
 
     Model translation must be the world pose of x500_mono_cam_down_0, not the
@@ -140,11 +141,9 @@ def compute_truth(model_position, model_quaternion, target_position=(5.0, 0.0, 1
     model_position = _vector(model_position, 3)
     target_position = _vector(target_position, 3)
     r_wm = quaternion_rotation(model_quaternion)
-    s, c = math.sin(CAMERA_PITCH), math.cos(CAMERA_PITCH)
-    r_mount = ((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c))
-    r_wc = _mm(_mm(r_wm, r_mount), OPTICAL_TO_SENSOR)
+    r_wc = _mm(_mm(r_wm, camera_rotation), OPTICAL_TO_SENSOR)
     body_world = _plus(model_position, _mv(r_wm, BASE_IN_MODEL))
-    camera_world = _plus(model_position, _mv(r_wm, CAMERA_IN_MODEL))
+    camera_world = _plus(model_position, _mv(r_wm, camera_position))
     r_nb = _mm(_mm(ENU_TO_NED, r_wm), FRD_TO_FLU)
     return {
         "p_camera_true": _mv(_transpose(r_wc), _minus(target_position, camera_world)),
@@ -180,11 +179,16 @@ class GroundTruth:
 
     def __init__(self, world="pnp_pillar", model="x500_mono_cam_down_0",
                  target="pnp_target_pillar", target_fallback=(5.0, 0.0, 1.5),
-                 *, connect=True):
+                 *, connect=True, camera_position=CAMERA_IN_MODEL,
+                 camera_rotation=CAMERA_ROTATION_IN_MODEL):
         self.world = world
         self.model = model
         self.target = target
         self.target_fallback = _vector(target_fallback, 3)
+        self.camera_position = _vector(camera_position, 3)
+        self.camera_rotation = tuple(_vector(row, 3) for row in camera_rotation)
+        if len(self.camera_rotation) != 3:
+            raise ValueError('Camera rotation must be 3x3')
         self._lock = threading.RLock()
         self._poses = deque(maxlen=600)
         self._target_pose = None
@@ -343,7 +347,9 @@ class GroundTruth:
                 difference = _minus(_body_position(second), _body_position(first))
                 velocity_enu = tuple(v * 1_000_000.0 / duration_us for v in difference)
         target_position = target.position if target is not None else self.target_fallback
-        result = compute_truth(chosen.position, chosen.quaternion, target_position, velocity_enu)
+        result = compute_truth(chosen.position, chosen.quaternion, target_position, velocity_enu,
+                               camera_position=self.camera_position,
+                               camera_rotation=self.camera_rotation)
         target_source = "gazebo_target_pose" if target is not None else "map_fallback"
         result.update({
             "truth_dt_us": time_difference,

@@ -7,6 +7,10 @@ run_tag="$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$bundle_dir/logs"
 bridge_log="$bundle_dir/logs/bridge_${run_tag}.log"
 algorithm_log="$bundle_dir/logs/algorithm_${run_tag}.log"
+mission_option=0
+for option in "$@"; do
+  if [[ "$option" == --mission ]]; then mission_option=1; fi
+done
 child_groups=()
 
 cleanup() {
@@ -33,6 +37,11 @@ trap 'exit 143' TERM
 
 install -m 644 "$bundle_dir/pnp_pillar.sdf" \
   "$px4_dir/Tools/simulation/gz/worlds/pnp_pillar.sdf"
+
+# Keep the physical camera pose, algorithm extrinsics and truth conversion in
+# agreement with the original OpenMV configuration on every fresh launch.
+/usr/bin/python3 -B "$bundle_dir/pnp_integration/camera_mount.py" \
+  --px4-dir "$px4_dir" "$@"
 
 # Gazebo Harmonic lists subscribed topics too. Starting GroundTruth before
 # PX4 makes its clock subscription look like an already running world to
@@ -65,6 +74,9 @@ child_groups+=("$!")
 
 printf '相机桥接日志：%s\n算法日志：%s\n' "$bridge_log" "$algorithm_log"
 printf 'PX4、Gazebo、桥接和算法由本终端一起启动；相机窗口选择 /pnp/debug_image。\n'
+if [ "$mission_option" -eq 1 ]; then
+  printf 'Mission视觉模式：等待手动起飞并粗导航，出现 READY_FOR_MISSION 后手动切 Mission。\n'
+fi
 
 cd "$px4_dir"
 source /home/hhkqwq/px4-venv/bin/activate

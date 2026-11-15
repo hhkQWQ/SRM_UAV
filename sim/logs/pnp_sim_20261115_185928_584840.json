@@ -1,0 +1,132 @@
+{
+  "mode": "mission_standby",
+  "algorithm_dir": "/home/hhkqwq/SRM_UAV/PnP",
+  "simulation_overrides": {
+    "R_BC": [
+      [
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        -1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "T_BC_M": [
+      0.14,
+      0.0,
+      0.04
+    ]
+  },
+  "camera_mount": {
+    "source": "original config.py extrinsics; verified against actual Gazebo model",
+    "position_in_model_m": [
+      0.14,
+      0.0,
+      0.19999999999999998
+    ],
+    "sensor_rotation_in_model": [
+      [
+        -6.123233995736766e-17,
+        1.2246467991473532e-16,
+        -1.0
+      ],
+      [
+        -7.498798913309288e-33,
+        -1.0,
+        -1.2246467991473532e-16
+      ],
+      [
+        -1.0,
+        0.0,
+        6.123233995736766e-17
+      ]
+    ]
+  },
+  "detector_config": {
+    "LIGHT_EXTRACT_MODE": "GRAY",
+    "TARGET_COLOR": "ANY",
+    "LIGHT_L_MIN": 25,
+    "RED_THRESHOLD": [
+      10,
+      100,
+      20,
+      127,
+      -30,
+      127
+    ],
+    "BLUE_THRESHOLD": [
+      36,
+      100,
+      -60,
+      80,
+      -128,
+      0
+    ]
+  },
+  "processing_resolution": [
+    320,
+    240
+  ],
+  "ground_truth_policy": "metrics and labelled attitude assistance only; never a control position input",
+  "shadow_policy": "simulated ready/armed/offboard gates; diagnostic output only",
+  "options": {
+    "algorithm_dir": "/home/hhkqwq/SRM_UAV/PnP",
+    "px4_dir": "/home/hhkqwq/PX4-Autopilot",
+    "world": "pnp_pillar",
+    "model": "x500_mono_cam_down_0",
+    "image_topic": "/pnp/image_raw",
+    "camera_info_topic": "/pnp/camera_info",
+    "log_dir": "/home/hhkqwq/SRM_UAV/sim/logs",
+    "max_fps": null,
+    "opencv_threads": 2,
+    "mavlink_port": 14540,
+    "no_mavlink": false,
+    "truth_attitude": false,
+    "enable_control": true,
+    "mission": true
+  },
+  "mission_policy": "Pilot flies and enters Mission; a current-PX4-position loiter is staged only after stable visual acquisition. Visual handover uses PnP and PX4 telemetry.",
+  "camera_calibration": {
+    "native_size": [
+      320,
+      240
+    ],
+    "native_k": [
+      302.11830698360654,
+      0.0,
+      163.3557244238438,
+      0.0,
+      302.03599395976175,
+      117.66487385855488,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "native_d": [
+      0.09984656079919686,
+      -0.23986524630434,
+      -0.0007887596884331264,
+      0.00012132382106465136,
+      0.16915439320944928
+    ],
+    "processing_size": [
+      320,
+      240
+    ],
+    "processing_intrinsics": [
+      302.11830698360654,
+      302.03599395976175,
+      163.3557244238438,
+      117.66487385855488
+    ],
+    "resize": "INTER_AREA; pixel-center mapping"
+  }
+}

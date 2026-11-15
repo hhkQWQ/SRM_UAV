@@ -1,4 +1,4 @@
-"""固定四点平面PnP：归一化单应初始化 + 有界LM。只依赖math/config。"""
+"""固定四点平面PnP：自由位姿多起点LM，或已知水平法向的4DoF求解。"""
 import math
 import config as C
 
@@ -57,6 +57,12 @@ def camera_to_body(p, r_bc, t_bc):
 def local_to_camera(p, q_nb, r_bc, t_bc):
     body = mv(transpose(quaternion_rotation(q_nb)), p)
     return mv(transpose(r_bc), tuple(body[i]-t_bc[i] for i in range(3)))
+
+def camera_down_normal(q_nb, r_bc):
+    """水平朝上靶的板内法向；仅使用曝光时刻的飞控姿态与安装标定。"""
+    if not rotation_valid(r_bc):
+        raise ValueError("invalid camera rotation")
+    return mv(transpose(r_bc), mv(transpose(quaternion_rotation(q_nb)), (0.,0.,1.)))
 
 def quad_valid(points, min_area=0., min_edge=0.):
     if len(points) != 4 or not all(len(p) == 2 and finite(p) for p in points):
@@ -180,8 +186,9 @@ class PlanarPoseSolver:
         r = transpose((r1, r2, cross(r1,r2)))
         return r, tuple(scale*v for v in c3)
 
-    def _cost(self, r, t, observations, jacobian=False):
-        a, b, cost = [[0.]*6 for _ in range(6)], [0.]*6, 0.
+    def _cost(self, r, t, observations, jacobian=False, normal=None):
+        dimensions = 6 if normal is None else 4
+        a, b, cost = [[0.]*dimensions for _ in range(dimensions)], [0.]*dimensions, 0.
         fx, fy = self.k[:2]
         for (x, y), obs in zip(self.xy, observations):
             v = mv(r, (x,y,0.))
@@ -192,56 +199,105 @@ class PlanarPoseSolver:
             ru, rv = (obs[0]-xn)*fx, (obs[1]-yn)*fy
             cost += ru*ru+rv*rv
             if jacobian:
-                dv = ((0.,-v[2],v[1]),(v[2],0.,-v[0]),(-v[1],v[0],0.))
+                dv = (((0.,-v[2],v[1]),(v[2],0.,-v[0]),(-v[1],v[0],0.))
+                      if normal is None else (cross(normal,v),))
                 ju = [fx*(d[0]-xn*d[2])/pz for d in dv]+[fx/pz,0.,-fx*xn/pz]
                 jv = [fy*(d[1]-yn*d[2])/pz for d in dv]+[0.,fy/pz,-fy*yn/pz]
-                for i in range(6):
+                for i in range(dimensions):
                     b[i] += ju[i]*ru+jv[i]*rv
-                    for j in range(i,6):
+                    for j in range(i,dimensions):
                         a[i][j] += ju[i]*ju[j]+jv[i]*jv[j]
         if jacobian:
-            for i in range(6):
+            for i in range(dimensions):
                 for j in range(i):
                     a[i][j] = a[j][i]
         return cost, a, b
 
-    def solve(self, pixels, previous=None):
+    def _normal_initial(self, observations, normal):
+        # 固定法向后，投影方程对(cos(yaw)/tz,sin(yaw)/tz,tx/tz,ty/tz)
+        # 为线性。恢复单位圆尺度即可得到米制距离，避免小目标单应法向放大噪声。
+        reference = (0.,1.,0.) if abs(normal[1]) < .9 else (1.,0.,0.)
+        first = unit(cross(reference,normal))
+        second = cross(normal,first)
+        a, b = [[0.]*4 for _ in range(4)], [0.]*4
+        for (x,y), observed in zip(self.xy,observations):
+            va = tuple(first[i]*x+second[i]*y for i in range(3))
+            vb = tuple(second[i]*x-first[i]*y for i in range(3))
+            for axis in range(2):
+                u = observed[axis]
+                row = (va[axis]-u*va[2],vb[axis]-u*vb[2],
+                       1. if axis == 0 else 0.,1. if axis == 1 else 0.)
+                weight = self.k[axis]**2
+                for i in range(4):
+                    b[i] += weight*row[i]*u
+                    for j in range(4):
+                        a[i][j] += weight*row[i]*row[j]
+        c,s,tx,ty = linear_solve(a,b)
+        depth = 1./hypot2(c,s)
+        c,s = c*depth,s*depth
+        r1 = tuple(first[i]*c+second[i]*s for i in range(3))
+        r2 = tuple(-first[i]*s+second[i]*c for i in range(3))
+        return transpose((r1,r2,normal)),(tx*depth,ty*depth,depth)
+
+    def _refine(self, r, t, observations, normal=None):
+        cost = self._cost(r,t,observations)[0]
+        damping, used = 1e-3, 0
+        dimensions = 6 if normal is None else 4
+        rotation_dimensions = dimensions-3
+        for _ in range(self.iterations):
+            if cost < 1e-10:
+                break
+            _, a, b = self._cost(r,t,observations,True,normal)
+            for i in range(dimensions):
+                a[i][i] += damping*(a[i][i]+1e-6)
+            step = linear_solve(a,b)
+            if norm(step[:rotation_dimensions]) > .5 or norm(step[rotation_dimensions:]) > max(.1,t[2]):
+                damping *= 10.
+                continue
+            rotation_step = step[:3] if normal is None else tuple(step[0]*n for n in normal)
+            trial_r = mm(exp_rotation(rotation_step),r)
+            trial_t = tuple(t[i]+step[i+rotation_dimensions] for i in range(3))
+            try:
+                trial_cost = self._cost(trial_r,trial_t,observations)[0]
+            except ValueError:
+                trial_cost = float("inf")
+            used += 1
+            if trial_cost < cost:
+                r,t,cost = trial_r,trial_t,trial_cost
+                damping = max(1e-8,damping*.3)
+                if norm(step) < 1e-7:
+                    break
+            else:
+                damping *= 10.
+        return r,t,cost,used
+
+    def solve(self, pixels, previous=None, normal_camera=None):
+        """normal_camera非空表示已知靶面法向；不把该先验当作测得的法向。"""
         if not quad_valid(pixels, C.MIN_QUAD_AREA_PX2, C.MIN_EDGE_PX):
             return {"valid":False, "reason":"POINT_GEOMETRY"}
         try:
             observations = tuple(self.undistort(p) for p in pixels)
-            r, t = self._initial(observations)
-            cost = self._cost(r,t,observations)[0]
-            if previous is not None and previous.get("valid"):
-                pr, pt = previous["rotation"], previous["position"]
-                pcost = self._cost(pr,pt,observations)[0]
-                if pcost < cost:
-                    r,t,cost = pr,pt,pcost
-            damping, used = 1e-3, 0
-            for _ in range(self.iterations):
-                if cost < 1e-10:
-                    break
-                _, a, b = self._cost(r,t,observations,True)
-                for i in range(6):
-                    a[i][i] += damping*(a[i][i]+1e-6)
-                step = linear_solve(a,b)
-                if norm(step[:3]) > 0.5 or norm(step[3:]) > max(0.1,t[2]):
-                    damping *= 10.
-                    continue
-                trial_r = mm(exp_rotation(step[:3]),r)
-                trial_t = tuple(t[i]+step[i+3] for i in range(3))
-                try:
-                    trial_cost = self._cost(trial_r,trial_t,observations)[0]
-                except ValueError:
-                    trial_cost = float("inf")
-                used += 1
-                if trial_cost < cost:
-                    r,t,cost = trial_r,trial_t,trial_cost
-                    damping = max(1e-8,damping*0.3)
-                    if norm(step) < 1e-7:
-                        break
-                else:
-                    damping *= 10.
+            if normal_camera is not None:
+                if len(normal_camera) != 3 or not finite(normal_camera):
+                    raise ValueError("invalid normal")
+                normal = unit(normal_camera)
+                r,t = self._normal_initial(observations,normal)
+                r,t,cost,used = self._refine(r,t,observations,normal)
+                mode = "HORIZONTAL"
+            else:
+                # 两个起点分别优化后再比较。先按初始误差挑一个，会被旧姿态
+                # 的局部极小值锁住；新的单应候选必须有独立的优化机会。
+                r,t = self._initial(observations)
+                r,t,cost,used = self._refine(r,t,observations)
+                if previous is not None and previous.get("valid"):
+                    try:
+                        pr,pt,pcost,pused = self._refine(previous["rotation"],previous["position"],observations)
+                        used += pused
+                        if pcost < cost:
+                            r,t,cost = pr,pt,pcost
+                    except (ValueError,ZeroDivisionError,OverflowError):
+                        pass
+                mode = "FREE"
             error = 0.
             for (x,y), observed in zip(self.xy,pixels):
                 rotated = mv(r,(x,y,0.))
@@ -255,7 +311,7 @@ class PlanarPoseSolver:
                      and math.isfinite(rms) and rms <= C.MAX_REPROJECTION_PX)
             return {"valid":valid, "reason":"OK" if valid else "POSE_QUALITY",
                     "position":t, "rotation":r, "reprojection_px":rms,
-                    "center":self.project(t), "iterations":used}
+                    "center":self.project(t), "iterations":used,"mode":mode}
         except (ValueError, ZeroDivisionError, OverflowError):
             return {"valid":False, "reason":"NUMERICAL"}
 

@@ -1,3 +1,0 @@
-[INFO] [1794676141.852591768] [ros_gz_bridge]: Creating GZ->ROS Bridge: [/world/pnp_pillar/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image (gz.msgs.Image) -> /world/pnp_pillar/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image (sensor_msgs/msg/Image)] (Lazy 0)
-[INFO] [1794676141.857587291] [ros_gz_bridge]: Creating GZ->ROS Bridge: [/world/pnp_pillar/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info (gz.msgs.CameraInfo) -> /world/pnp_pillar/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info (sensor_msgs/msg/CameraInfo)] (Lazy 0)
-[INFO] [1794676352.063062897] [rclcpp]: signal_handler(SIGINT/SIGTERM)

@@ -9,7 +9,6 @@ import math
 from pathlib import Path
 import signal
 import time
-import xml.etree.ElementTree as ET
 
 import cv2
 import numpy as np
@@ -22,6 +21,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 
 from algorithm_core import Algorithm, quaternion_from_rotation
+from camera_mount import read_camera_mount
 from gazebo_truth import GroundTruth
 from udp_uart import UdpUart
 
@@ -42,25 +42,9 @@ def finite_json(value):
     return value
 
 
-def check_stock_camera(px4):
-    models = Path(px4) / 'Tools/simulation/gz/models'
-    top = ET.parse(models / 'x500_mono_cam_down/model.sdf').getroot().find('model')
-    include = next(x for x in top.findall('include')
-                   if x.findtext('uri') == 'model://mono_cam')
-    camera = tuple(float(x) for x in include.findtext('pose').split())
-    base = ET.parse(models / 'x500_base/model.sdf').find('model')
-    base_pose = tuple(float(x) for x in base.findtext('pose').split())
-    if not (np.allclose(camera, (0., 0., .1, 0., 1.5707, 0.), atol=1e-8)
-            and np.allclose(base_pose, (0., 0., .24, 0., 0., 0.), atol=1e-8)):
-        raise ValueError('Camera/base installation changed; update simulation extrinsics before running')
-    imager = ET.parse(models / 'mono_cam/model.sdf').find('./model/link/sensor')
-    sensor_pose = tuple(float(x) for x in imager.findtext('pose', '0 0 0 0 0 0').split())
-    if not np.allclose(sensor_pose, np.zeros(6), atol=1e-8):
-        raise ValueError('Camera sensor has a nonzero local pose; update extrinsics')
-
-
 CSV_FIELDS = (
-    'frame', 'sim_time_s', 'image_age_ms', 'pipeline_ms', 'pose_valid', 'pose_reason',
+    'frame', 'sim_time_s', 'image_age_ms', 'pipeline_ms', 'pose_valid', 'pose_reason', 'pnp_mode',
+    'q_w', 'q_x', 'q_y', 'q_z',
     'track_state', 'attitude_source', 'flight_reason', 'armed', 'offboard',
     'p_camera_x_m', 'p_camera_y_m', 'p_camera_z_m', 'reprojection_px',
     'relative_n_m', 'relative_e_m', 'relative_d_m',
@@ -69,6 +53,11 @@ CSV_FIELDS = (
     'body_world_x_m', 'body_world_y_m', 'body_world_z_m',
     'shadow_state', 'shadow_vn_mps', 'shadow_ve_mps', 'shadow_vd_mps',
     'control_enabled', 'control_state', 'control_submitted',
+    'mission_enabled', 'mission_state', 'mission_prepare', 'mission_error', 'handover_state',
+    'mission_seq', 'main_mode', 'sub_mode',
+    'control_vn_mps', 'control_ve_mps', 'control_vd_mps',
+    'target_horizontal_error_m', 'target_height_error_m',
+    'true_relative_n_m', 'true_relative_e_m', 'true_relative_d_m',
     'u1', 'v1', 'u2', 'v2', 'u3', 'v3', 'u4', 'v4',
 )
 
@@ -77,9 +66,12 @@ class PnpNode(Node):
     def __init__(self, options):
         super().__init__('pnp_sim_algorithm')
         self.options = options
-        check_stock_camera(options.px4_dir)
-        self.algorithm = Algorithm(options.algorithm_dir, options.enable_control)
-        self.truth = GroundTruth(options.world, options.model)
+        self.algorithm = Algorithm(options.algorithm_dir, options.enable_control, options.mission)
+        camera_position, camera_rotation = read_camera_mount(
+            options.px4_dir, self.algorithm.config.R_BC, self.algorithm.config.T_BC_M)
+        self.truth = GroundTruth(options.world, options.model,
+                                 camera_position=camera_position,
+                                 camera_rotation=camera_rotation)
         self.bridge = CvBridge()
         self.pending = deque(maxlen=1)
         self.last_result = None
@@ -97,6 +89,10 @@ class PnpNode(Node):
         self.generation = self.truth.generation
         self.attitude_source = 'NONE'
         self.control_submitted = False
+        self.last_command = None
+        self.mission_state = 'DISABLED'
+        self.mission_error = None
+        self.last_mission_report = None
         self.transport = self.link = None
         if not options.no_mavlink:
             try:
@@ -110,6 +106,9 @@ class PnpNode(Node):
         elif options.enable_control:
             raise ValueError('--enable-control requires MAVLink')
         self.link_generation = self.link.generation if self.link else 0
+        self.mission_runner = None
+        if options.mission:
+            self.mission_runner = self.algorithm.modules.standby.MissionStandby(self.link)
         self.image_publisher = self.create_publisher(Image, '/pnp/debug_image', qos_profile_sensor_data)
         self.pose_publisher = self.create_publisher(PoseStamped, '/pnp/target_camera', 10)
         self.relative_publisher = self.create_publisher(PointStamped, '/pnp/relative_ned', 10)
@@ -127,11 +126,16 @@ class PnpNode(Node):
         self.csv = csv.DictWriter(self.csv_file, fieldnames=CSV_FIELDS)
         self.csv.writeheader()
         settings = {
-            'mode': 'control' if options.enable_control else 'observe',
+            'mode': 'mission_standby' if options.mission else ('control' if options.enable_control else 'observe'),
             'algorithm_dir': str(Path(options.algorithm_dir).resolve()),
             'simulation_overrides': {
                 'R_BC': self.algorithm.config.R_BC,
                 'T_BC_M': self.algorithm.config.T_BC_M,
+            },
+            'camera_mount': {
+                'source': 'original config.py extrinsics; verified against actual Gazebo model',
+                'position_in_model_m': camera_position,
+                'sensor_rotation_in_model': camera_rotation,
             },
             'detector_config': {
                 key: getattr(self.algorithm.config,key) for key in
@@ -141,6 +145,7 @@ class PnpNode(Node):
             'ground_truth_policy': 'metrics and labelled attitude assistance only; never a control position input',
             'shadow_policy': 'simulated ready/armed/offboard gates; diagnostic output only',
             'options': vars(options),
+            'mission_policy': 'Pilot flies and enters Mission; a current-PX4-position loiter is staged only after stable visual acquisition. Visual handover uses PnP and PX4 telemetry.',
         }
         self.settings = settings
         self.settings_path = log_dir / f'{name}.json'
@@ -148,6 +153,8 @@ class PnpNode(Node):
         self.timer = self.create_timer(.01, self.on_tick)
         self.get_logger().info(f'Mode={settings["mode"]}; CSV={self.csv_path}')
         self.get_logger().info('Waiting for image, CameraInfo and Gazebo simulation clock')
+        if options.mission:
+            self.get_logger().info('MISSION待命：手动起飞到可见标靶处并稳定悬停，等待 READY_FOR_MISSION，再手动选择 Mission。')
 
     def on_info(self, message):
         try:
@@ -193,7 +200,7 @@ class PnpNode(Node):
         now = self.truth.now_us()
         if self.truth.generation != self.generation:
             self.generation = self.truth.generation
-            self.algorithm.reset()
+            self.algorithm.reset(reset_control=False)
             self.last_result = None
             self.last_frame_us = None
             self.last_control_us = now
@@ -206,7 +213,7 @@ class PnpNode(Node):
             self.link.poll()
             if self.link.generation != self.link_generation:
                 self.link_generation = self.link.generation
-                self.algorithm.reset()
+                self.algorithm.reset(reset_control=False)
                 self.last_result = None
                 self.attitude_source = 'NONE'
         wall = time.monotonic()
@@ -262,12 +269,13 @@ class PnpNode(Node):
         if self.attitude_source != previous_source:
             # Do not blend tracking or prediction history across attitude
             # sources. Control mode never uses truth-assisted observations.
-            self.algorithm.reset()
+            self.algorithm.reset(reset_control=False)
         started = time.perf_counter()
         result = self.algorithm.process(frame, capture, q, velocity)
         result['pipeline_ms'] = (time.perf_counter() - started) * 1000.
         result['stamp_us'] = capture
         result['attitude_source'] = self.attitude_source
+        result['q_nb'] = q
         flight = self.flight_state(now)
         shadow = self.algorithm.shadow(result, capture, flight.get('yaw', 0.))
         result['shadow'] = shadow
@@ -296,11 +304,23 @@ class PnpNode(Node):
                   'body_world_m': truth['body_world'] if truth else None,
                   'shadow_simulated_gates': shadow,
                   'control_enabled': self.options.enable_control,
-                  'control_state': self.algorithm.control_servo.state,
+                  'control_state': self.controller_state(),
+                  'mission_enabled': self.options.mission,
+                  'mission_state': self.algorithm.handover.state,
+                  'mission_prepare': self.mission_state,
+                  'mission_error': self.mission_error,
+                  'handover_state': self.algorithm.handover.state,
+                  'mission_seq': flight.get('mission_seq'),
+                  'main_mode': flight.get('main_mode'),
+                  'sub_mode': flight.get('sub_mode'),
                   'image_age_ms': (now - capture) / 1000,
                   'pipeline_ms': result['pipeline_ms'],
                   'red_lights': result['lights_red'],
                   'dropped_stale_images': self.drop_count}
+        if truth:
+            relative_truth = truth['relative_ned_true']
+            status['target_horizontal_error_m'] = math.hypot(relative_truth[0], relative_truth[1])
+            status['target_height_error_m'] = relative_truth[2] - self.algorithm.config.TARGET_HEIGHT_M
         status['processing_resolution'] = self.algorithm.processing_size
         status['native_resolution'] = self.algorithm.capture_size
         self.status_publisher.publish(String(data=json.dumps(finite_json(status), allow_nan=False)))
@@ -365,9 +385,11 @@ class PnpNode(Node):
                  f'{status["pose_reason"]} | {status["track"]}',
                  f'attitude: {self.attitude_source}',
                  f'PX4: {status["flight_reason"]} | '
-                 f'controller: {self.algorithm.control_servo.state}',
+                 f'controller: {self.controller_state()}',
                  f'pipeline: {status["pipeline_ms"]:.1f} ms | '
                  f'detection input: {self.algorithm.processing_size} | original config']
+        if self.options.mission:
+            lines.insert(2, f'mission: {self.mission_state} | handover: {self.algorithm.handover.state}')
         if status['p_camera_m'] is not None:
             p = status['p_camera_m']
             lines.append(f'target in camera xyz: {p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f} m')
@@ -386,8 +408,15 @@ class PnpNode(Node):
             cv2.putText(frame, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, .59,
                         (255, 255, 255), 1, cv2.LINE_AA)
 
+    def controller_state(self):
+        if self.options.mission:
+            handover = self.algorithm.handover
+            return handover.servo.state if handover.state == 'ACTIVE' else handover.state
+        return self.algorithm.control_servo.state
+
     def control_tick(self, now):
         self.control_submitted = False
+        self.last_command = None
         if not self.link or not self.options.enable_control:
             return
         flight = self.link.state(now)
@@ -396,9 +425,11 @@ class PnpNode(Node):
                  and result['attitude_source'] == 'PX4_MAVLINK'
                  and self.last_image_wall is not None
                  and time.monotonic() - self.last_image_wall < .5)
-        if not fresh:
-            flight = dict(flight, ready=False, reason='IMAGE_OR_PX4_ATTITUDE_STALE')
         track = dict(result['track']) if result else {'position': None, 'state': 'LOST', 'generation': 0}
+        if not fresh:
+            # Keep the healthy flight gate available for bounded braking;
+            # camera loss is an unavailable target, not a telemetry failure.
+            track.update(position=None, state='LOST')
         if fresh and track.get('position') is not None:
             delay = (now - result['stamp_us']) / 1e6
             v = flight.get('velocity')
@@ -407,33 +438,61 @@ class PnpNode(Node):
             if track.get('age_ms') is None or track['age_ms'] + delay * 1000 > self.algorithm.config.MAX_PREDICTION_MS:
                 track['position'] = None
                 track['state'] = 'LOST'
-        output = self.algorithm.control_servo.update(
-            track, flight, now // 1000, not self.algorithm.config.readiness_errors())
+        configured = not self.algorithm.config.readiness_errors()
+        if self.options.mission:
+            handover = self.algorithm.handover
+            staging = self.mission_runner.update(track, flight, now, configured, handover=handover)
+            output = handover.update(track, flight, now // 1000, configured,
+                                     mission_prepared=staging['ready'])
+            if handover.locked:
+                staging = self.mission_runner.update(track, flight, now, configured,
+                                                      events=[], handover=handover)
+            self.mission_state, self.mission_error = staging['state'], staging.get('error')
+            if self.mission_state != self.last_mission_report:
+                self.get_logger().info(f'Mission={self.mission_state}; error={self.mission_error}')
+                self.last_mission_report = self.mission_state
+        else:
+            output = self.algorithm.control_servo.update(track, flight, now // 1000, configured)
         if output is None:
             self.link.cancel_setpoint()
         else:
-            self.control_submitted = self.link.send_velocity(output['velocity'], output['yaw'], now)
+            requested = output.get('request_mode')
+            if requested is not None:
+                self.link.send_command(176, (1., float(requested[0]), float(requested[1]), 0., 0., 0., 0.))
+            if output.get('velocity') is None:
+                self.link.cancel_setpoint()
+            else:
+                self.control_submitted = self.link.send_velocity(output['velocity'], output['yaw'], now)
+                self.last_command = output
 
     def record(self, result, status, flight, truth):
         row = {key: status.get(key) for key in ('pose_valid', 'pose_reason', 'attitude_source',
                'flight_reason', 'armed', 'offboard', 'camera_error_m', 'relative_error_m',
-               'truth_dt_us', 'truth_source', 'control_enabled')}
+               'truth_dt_us', 'truth_source', 'control_enabled',
+               'mission_enabled', 'mission_state', 'mission_prepare', 'mission_error', 'handover_state',
+               'mission_seq', 'main_mode', 'sub_mode',
+               'target_horizontal_error_m', 'target_height_error_m')}
         row.update(frame=self.frame_count, sim_time_s=status['sim_time_s'],
                    image_age_ms=status['image_age_ms'], pipeline_ms=result['pipeline_ms'],
                    track_state=result['track']['state'],
                    reprojection_px=result['pose'].get('reprojection_px') if result['pose'] else None,
                    shadow_state=self.algorithm.shadow_servo.state,
-                   control_state=self.algorithm.control_servo.state,
+                   control_state=self.controller_state(),
                    control_submitted=self.control_submitted)
+        row['pnp_mode'] = result['pose'].get('mode') if result['pose'] else None
+        for i, axis in enumerate(('w', 'x', 'y', 'z')):
+            row['q_' + axis] = result['q_nb'][i] if result.get('q_nb') else None
         vectors = [('p_camera', status['p_camera_m'], ('x', 'y', 'z')),
                    ('relative', status['relative_ned_m'], ('n', 'e', 'd')),
                    ('true_camera', status['true_camera_m'], ('x', 'y', 'z')),
                    ('body_world', status['body_world_m'], ('x', 'y', 'z'))]
+        vectors.append(('true_relative', truth['relative_ned_true'] if truth else None, ('n', 'e', 'd')))
         for prefix, value, axes in vectors:
             for i, axis in enumerate(axes):
                 row[f'{prefix}_{axis}_m'] = value[i] if value is not None else None
         for i, axis in enumerate(('n', 'e', 'd')):
             row[f'shadow_v{axis}_mps'] = result['shadow']['velocity'][i] if result['shadow'] else None
+            row[f'control_v{axis}_mps'] = self.last_command['velocity'][i] if self.last_command else None
         if result['points'] is not None:
             for i, (u, v) in enumerate(result['points'], 1):
                 row[f'u{i}'], row[f'v{i}'] = u, v
@@ -468,7 +527,16 @@ def arguments():
                         help='Explicit diagnostic-only Gazebo attitude assistance in observation mode')
     parser.add_argument('--enable-control', action='store_true',
                         help='Allow original controller velocity setpoints; never arms or switches modes')
+    parser.add_argument('--mission', action='store_true',
+                        help='Pilot flies and selects Mission; stage current-position loiter then automatically hand over to visual Offboard')
     options, ros_args = parser.parse_known_args()
+    if options.mission:
+        options.enable_control = True
+        if options.truth_attitude:
+            parser.error('--mission cannot use --truth-attitude')
+        if (options.world != 'pnp_pillar' or options.model != 'x500_mono_cam_down_0'
+                or options.mavlink_port != 14540):
+            parser.error('Mission actions are restricted to the local pnp_pillar / x500 SITL on UDP 14540')
     if options.max_fps is not None and (not math.isfinite(options.max_fps) or options.max_fps <= 0):
         parser.error('--max-fps must be positive')
     if options.no_mavlink and options.enable_control:

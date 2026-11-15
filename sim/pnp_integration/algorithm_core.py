@@ -45,33 +45,34 @@ def load_file(name, path):
     return module
 
 
-def load_original(directory, enable_control=False):
+def load_original(directory, enable_control=False, enable_mission=False):
     directory = Path(directory).resolve()
     config = load_file('_pnp_sim_config', directory / 'config.py')
     # Only platform/camera adaptations. Detector settings remain exactly as
     # loaded from the user's config.py, including GRAY/ANY and both thresholds.
     config.NAV_ENABLE = bool(enable_control)
+    config.MISSION_ENABLE = bool(enable_mission)
     config.CALIBRATION_CONFIRMED = False
-    a = 1.5707
-    config.R_BC = ((0., -math.sin(a), math.cos(a)),
-                   (1., 0., 0.), (0., math.cos(a), math.sin(a)))
-    config.T_BC_M = (0., 0., 0.14)
-    config.EXTRINSICS_CONFIRMED = True
+    # The Gazebo mount is generated from, and checked against, the original
+    # R_BC/T_BC_M. Do not replace the user's physical installation calibration.
     image_module = make_image_module()
     with module_aliases({'config': config, 'image': image_module}):
         pose = load_file('_pnp_sim_pose_solver', directory / 'pose_solver.py')
         with module_aliases({'pose_solver': pose}):
             tracker = load_file('_pnp_sim_target_tracker', directory / 'target_tracker.py')
             servo = load_file('_pnp_sim_visual_servo', directory / 'visual_servo.py')
+            with module_aliases({'visual_servo': servo}):
+                handover = load_file('_pnp_sim_mission_handover', directory / 'mission_handover.py')
+            standby = load_file('_pnp_sim_mission_standby', directory / 'mission_standby.py')
             link = load_file('_pnp_sim_flight_link', directory / 'flight_link.py')
             detector = load_file('_pnp_sim_armor_detect', directory / 'armor_detect.py')
     return SimpleNamespace(config=config, pose=pose, tracker=tracker,
-                           servo=servo, link=link, detector=detector)
+                           servo=servo, handover=handover, standby=standby, link=link, detector=detector)
 
 
 class Algorithm:
-    def __init__(self, directory, enable_control=False):
-        self.modules = load_original(directory, enable_control)
+    def __init__(self, directory, enable_control=False, enable_mission=False):
+        self.modules = load_original(directory, enable_control, enable_mission)
         self.config = self.modules.config
         self.processing_size = (int(self.config.IMAGE_WIDTH), int(self.config.IMAGE_HEIGHT))
         self.capture_size = None
@@ -79,10 +80,12 @@ class Algorithm:
         self.calibration = None
         self.reset()
 
-    def reset(self):
+    def reset(self, reset_control=True):
         self.tracker = self.modules.tracker.TargetTracker()
         self.shadow_servo = self.modules.servo.VisualServo()
-        self.control_servo = self.modules.servo.VisualServo()
+        if reset_control or not hasattr(self, 'control_servo'):
+            self.control_servo = self.modules.servo.VisualServo()
+            self.handover = self.modules.handover.MissionHandover()
         self.previous = None
         self.previous_color = None
 
@@ -110,7 +113,7 @@ class Algorithm:
                 self.config.TARGET_POINTS_T_M,
                 self.config.INTRINSICS, self.config.DIST_COEFFS)
             self.calibration = calibration
-            self.reset()
+            self.reset(reset_control=False)
 
     def prepare_image(self, bgr):
         """Match the original algorithm's resolution, with calibrated resizing."""
@@ -141,7 +144,10 @@ class Algorithm:
                          'size': float(max(width, height))}
             points = detector.get_pair_points(pair)
             hint = self.previous if color == self.previous_color else None
-            pose = self.solver.solve(points, hint)
+            normal_camera = None
+            if q_nb is not None and getattr(self.config, 'HORIZONTAL_TARGET', False):
+                normal_camera = self.modules.pose.camera_down_normal(q_nb, self.config.R_BC)
+            pose = self.solver.solve(points, hint, normal_camera=normal_camera)
             if pose['valid']:
                 self.previous, self.previous_color = pose, color
                 detection['center'] = pose['center']

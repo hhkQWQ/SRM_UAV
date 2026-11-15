@@ -16,6 +16,7 @@ class TargetTracker:
         self.last_ms = None
         self.velocity = None
         self.generation = 0
+        self.position_pending = None
 
     def _pending_step(self, detection):
         if detection is None:
@@ -36,21 +37,33 @@ class TargetTracker:
         self.center_misses = 0
         self.pending = None
         self.p, self.measurement_ms = None, None
+        self.position_pending = None
         self.pose_misses = 0
         self.generation += 1
         return True
 
     def update(self, detection, now_ms, relative_local=None, velocity_local=None):
+        if detection is not None:
+            center,size = detection.get("center"),detection.get("size")
+            if (center is None or len(center) != 2 or not finite(center) or
+                    size is None or not finite((size,)) or size <= 0):
+                detection = None
+                relative_local = None
+        if velocity_local is not None and (len(velocity_local) != 3 or not finite(velocity_local)):
+            velocity_local = None
         dt = 0. if self.last_ms is None else (now_ms-self.last_ms)*0.001
+        # 同一帧不能重复累计确认次数或刷新真实观测时间。
+        if self.last_ms is not None and now_ms == self.last_ms:
+            return self._result(now_ms,False,False,velocity_local is not None)
         # 控制延迟或时钟跳变不能被当作短时预测。
         if dt < 0 or dt > C.MAX_PREDICTION_MS*0.001:
             self.center, self.p, self.pending = None,None,None
             self.measurement_ms = None
             self.velocity = None
+            self.position_pending = None
+            self.generation += 1
             dt = 0.
         self.last_ms = now_ms
-        if velocity_local is not None and (len(velocity_local) != 3 or not finite(velocity_local)):
-            velocity_local = None
         if self.p is not None and velocity_local is not None:
             previous_v = velocity_local if self.velocity is None else self.velocity
             self.p = tuple(self.p[i]-0.5*(previous_v[i]+velocity_local[i])*dt for i in range(3))
@@ -81,22 +94,43 @@ class TargetTracker:
         measured = False
         if matched and relative_local is not None and len(relative_local) == 3 and finite(relative_local):
             fresh_track = self.p is None or self.measurement_ms is None
-            if fresh_track or norm(tuple(relative_local[i]-self.p[i] for i in range(3))) <= C.POSITION_JUMP_M:
+            accepted = not fresh_track and norm(tuple(relative_local[i]-self.p[i] for i in range(3))) <= C.POSITION_JUMP_M
+            if fresh_track:
+                pending = self.position_pending
+                count = 1
+                estimate = tuple(relative_local)
+                if pending is not None and 0 < now_ms-pending[1] <= C.MAX_PREDICTION_MS:
+                    prediction = pending[0]
+                    if velocity_local is not None:
+                        elapsed = (now_ms-pending[1])*0.001
+                        prediction = tuple(prediction[i]-velocity_local[i]*elapsed for i in range(3))
+                    if norm(tuple(relative_local[i]-prediction[i] for i in range(3))) <= C.POSITION_JUMP_M:
+                        count = pending[2]+1
+                        estimate = tuple(prediction[i]+(relative_local[i]-prediction[i])/count for i in range(3))
+                self.position_pending = (estimate,now_ms,count)
+                accepted = count >= C.POSE_CONFIRM_FRAMES
+            if accepted:
                 a = 1. if fresh_track else C.POSITION_ALPHA
-                self.p = tuple(relative_local[i] if fresh_track else (1-a)*self.p[i]+a*relative_local[i] for i in range(3))
+                self.p = estimate if fresh_track else tuple((1-a)*self.p[i]+a*relative_local[i] for i in range(3))
                 self.measurement_ms, self.pose_misses, measured = now_ms,0,True
+                self.position_pending = None
+        else:
+            self.position_pending = None
         if not measured:
             self.pose_misses += 1
+        return self._result(now_ms,measured,matched,velocity_local is not None)
+
+    def _result(self, now_ms, measured, matched, velocity_available):
         age = None if self.measurement_ms is None else now_ms-self.measurement_ms
         usable = (self.center is not None and self.p is not None and age is not None
                   and 0 <= age <= C.MAX_PREDICTION_MS and self.pose_misses <= C.MAX_LOST_FRAMES
-                  and (measured or velocity_local is not None))
+                  and (measured or velocity_available))
         if not usable:
             self.p = None
         state = "MEASURED" if measured else ("PREDICTED" if usable else
                 ("CENTER_ONLY" if self.center is not None else
                  ("ACQUIRING" if self.pending is not None else "LOST")))
         return {"state":state, "position":self.p if usable else None,
-                "center":self.center, "color":self.color, "age_ms":age,
+                "center":self.center, "size":self.size, "color":self.color, "age_ms":age,
                 "measurement_ms":self.measurement_ms, "generation":self.generation,
                 "pose_misses":self.pose_misses, "matched":matched}

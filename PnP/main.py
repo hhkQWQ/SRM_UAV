@@ -3,10 +3,13 @@ import math
 import os
 import config as C
 from pose_solver import (PlanarPoseSolver, finite, rotation_valid, local_to_camera,
-                         relative_measurement, quaternion_rotation, mv)
+                         relative_measurement, quaternion_rotation, mv,
+                         camera_down_normal)
 from target_tracker import TargetTracker
 from visual_servo import VisualServo
 from flight_link import Clock, FlightLink
+from mission_handover import MissionHandover
+from mission_standby import MissionStandby
 
 # 只记录诊断数据，不改变视觉、跟踪或导航参数。
 POSE_LOG_ENABLE = True
@@ -26,7 +29,9 @@ POSE_LOG_FIELDS = (
     "velocity_N_mps", "velocity_E_mps", "velocity_D_mps",
     "track", "nav", "flight", "track_age_ms", "observation_age_ms",
     "configured", "config_errors", "color",
-) + tuple("%s%d_px" % (axis, i) for i in range(1, 5) for axis in ("u", "v"))
+) + tuple("%s%d_px" % (axis, i) for i in range(1, 5) for axis in ("u", "v")) + (
+    "pnp_mode", "mission_prepare",
+)
 
 
 def attitude_rpy_deg(q):
@@ -134,7 +139,7 @@ class PoseCSVLogger:
 
 def pose_log_row(frame_id, stamp, now, capture_us, pre_log_us, fps,
                  solve_us, q, pose, relative, track, velocity, flight,
-                 nav_state, points, color):
+                 nav_state, points, color, mission_prepare=None):
     pose_valid = bool(pose and pose.get("valid"))
     p = pose.get("position") if pose_valid else None
     rotation = pose.get("rotation") if pose_valid else None
@@ -173,7 +178,9 @@ def pose_log_row(frame_id, stamp, now, capture_us, pre_log_us, fps,
         track["state"], nav_state, flight["reason"], track.get("age_ms"),
         None if measurement_ms is None else now//1000-measurement_ms,
         is_configured, "|".join(C.readiness_errors()), color,
-    ) + ((None,) * 8 if points is None else tuple(v for point in points for v in point))
+    ) + ((None,) * 8 if points is None else tuple(v for point in points for v in point)) + (
+        pose.get("mode") if pose else None, mission_prepare,
+    )
 
 
 def terminal_report(fps, position, q, solve_mean_ms, solve_peak_ms):
@@ -209,6 +216,9 @@ def run():
     solver = build_solver()
     tracker,servo = TargetTracker(),VisualServo()
     link = FlightLink(clock=clock) if C.LINK_ENABLE else None
+    mission = MissionHandover() if C.MISSION_ENABLE else None
+    standby = MissionStandby(link) if mission and link else None
+    nav_state = "DISABLED"
     last_report,last_control = clock.now_us(),-10000000
     logger = PoseCSVLogger(start_us=last_report)
     frames,solves,solve_sum,solve_peak,frame_id = 0,0,0,0,0
@@ -245,7 +255,9 @@ def run():
                     before = clock.now_us()
                     hint = previous if previous_color == color else None
                     points = detector.get_pair_points(pair)
-                    pose = solver.solve(points,hint)
+                    normal = (camera_down_normal(q,C.R_BC)
+                              if C.HORIZONTAL_TARGET and q is not None else None)
+                    pose = solver.solve(points,hint,normal_camera=normal)
                     spent = clock.now_us()-before
                     solves += 1
                     solve_sum += spent
@@ -267,9 +279,22 @@ def run():
                         control_track["position"] = tuple(track["position"][i]-current_v[i]*delay for i in range(3))
                     if (track["age_ms"] is None or track["age_ms"]+delay*1000 > C.MAX_PREDICTION_MS):
                         control_track["position"],control_track["state"] = None,"LOST"
-                output = servo.update(control_track,flight,now//1000,configured())
+                if mission is not None:
+                    staging = None
+                    if standby:
+                        staging = standby.update(control_track,flight,now,configured(),handover=mission)
+                    output = mission.update(control_track,flight,now//1000,configured(),
+                                            mission_prepared=bool(staging and staging["ready"]))
+                    if standby and mission.locked:
+                        standby.update(control_track,flight,now,configured(),events=[],handover=mission)
+                    nav_state = mission.state
+                else:
+                    output = servo.update(control_track,flight,now//1000,configured())
+                    nav_state = servo.state
                 if link:
-                    if output is None:
+                    if output and output.get("request_mode") is not None:
+                        link.request_mode(*output["request_mode"])
+                    if output is None or output.get("velocity") is None:
                         link.cancel_setpoint()
                     else:
                         link.send_velocity(output["velocity"],output["yaw"],now)
@@ -296,7 +321,8 @@ def run():
                     row = pose_log_row(
                         frame_id, stamp, pre_log_end, capture_end-capture_start,
                         pre_log_end-start, (frames+1)/seconds, spent, q, pose,
-                        relative, track, velocity, flight, servo.state, points, color)
+                        relative, track, velocity, flight, nav_state, points, color,
+                        standby.state if standby else None)
                     logger.write(row, pre_log_end)
                 except Exception as error:
                     logger.fail(error)
@@ -306,7 +332,9 @@ def run():
                 seconds = (end-last_report)*1e-6
                 print(terminal_report(frames/seconds, track["position"], q,
                                       solve_sum/solves*.001 if solves else None,
-                                      solve_peak*.001 if solves else None))
+                                      solve_peak*.001 if solves else None)
+                      + " nav=%s mission_prepare=%s" %
+                      (nav_state,standby.state if standby else "OFF"))
                 frames,solves,solve_sum,solve_peak = 0,0,0,0
                 last_report = end
                 detector.reset_stats()

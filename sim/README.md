@@ -1,96 +1,62 @@
-# Ubuntu PX4 仿真与 PnP 测试
+# PX4 / Gazebo PnP 视觉导航仿真
 
-环境：Ubuntu 22.04、PX4 v1.17、Gazebo Harmonic、QGroundControl、ROS 2 Humble。工程在 `/home/hhkqwq/SRM_UAV`，仿真文件集中在 `sim`。
+仿真沿用原 `PnP` 检测、求解、跟踪、控制程序，ROS 图像与 UDP 只负责替换 OpenMV 的取图和串口接口。输入保持 320×240、原相机内参与畸变、前移 14 cm / 下移 4 cm 的相机安装参数，以及 GRAY / ANY 灯条检测配置。Gazebo 原始相机通过桥接重映射为该标定图像。
 
-## 1. 每次从零启动
-
-先退出旧的 PX4、Gazebo、桥接和算法进程，再在终端执行：
+## 你需要的操作方式
 
 ```bash
-bash /home/hhkqwq/SRM_UAV/sim/start_simulation.sh
+bash /home/hhkqwq/SRM_UAV/sim/start_simulation.sh --mission
 ```
 
-入口会安装当前地图，启动 PX4、Gazebo、相机桥接和算法观测，并自动使用 `px4-venv`。模型为 `gz_x500_mono_cam_down`，世界为 `pnp_pillar`，飞机从原点生成。
-
-从应用菜单打开 QGroundControl，等待连接；用已配置好的虚拟摇杆，在 Position 模式手动起飞、移动和降落。
-
-新终端打开相机：
+此终端启动 PX4、Gazebo、图像桥接与算法。打开 QGC，并在相机窗口选择 `/pnp/debug_image`：
 
 ```bash
 source /opt/ros/humble/setup.bash
 ros2 run rqt_image_view rqt_image_view /pnp/debug_image
 ```
 
-`/pnp/debug_image` 显示检测结果，`/pnp/image_raw` 显示按原 OpenMV 标定成像的 `320×240` 画面。相机朝下，需飞到标靶上方才能看到它。先升到高于柱顶的位置，再平移过去。`/pnp/gazebo_image_raw` 保留 Gazebo 自带广角相机的原始画面，供检查接入层使用。
+1. 自行解锁、起飞，手动粗导航到能看见柱顶双灯条的位置。靶面世界高度为 1.5 米；建议机体先在靶面上方 2～3 米，保留正常灯条方向。
+2. 减速并保持装甲板完整可见。程序持续获得三维位置且速度小于 0.2 m/s 后，准备 Mission 保持项。
+3. 等待画面或算法日志显示 `READY_FOR_MISSION`，再由你在 QGC / 遥控器切到 Mission。
+4. 程序确认稳定观测，预热零速度参考，自动进入 Offboard；随后先水平对准，再下降并悬停在机体距靶面 1 米的位置。该地图最终世界高度约为 2.5 米。
 
-退出启动终端中的仿真后，入口会清理自己创建的桥接和算法进程。运行日志保存在 `/home/hhkqwq/SRM_UAV/sim/logs`。
+不需要在 QGC 标目标点。程序自动上传的任务仅包含飞机当前 GPS 位置和高度上的单项保持点，用于让 PX4 接受 Mission 切换。手动移动超过 25 cm、改变高度超过 15 cm 或准备点超过 10 秒时会重新准备，因此 `--mission` 会替换现有飞控任务。标靶的位置与最终悬停位置由 PnP 相对反馈计算，不使用 Gazebo 标靶坐标。
 
-## 2. 地图
+Mission 是接管触发；PX4 在 Offboard 中执行程序发来的视觉速度参考，因此视觉阶段 QGC 显示 Offboard。[PX4 Mission](https://docs.px4.io/main/en/flight_modes_mc/mission)、[PX4 Offboard](https://docs.px4.io/main/en/flight_modes/offboard)。
 
-当前地图：`/home/hhkqwq/SRM_UAV/sim/pnp_pillar.sdf`。
+`--mission` 不自动解锁、起飞或切入 Mission。到位后保持 Offboard，程序会持续修正悬停，无需再切 Mission。人工切走模式、时钟异常或丢靶会锁止视觉接管并显示 `BLOCKED_原因`；此时切 Mission 将被退回 Hold。重新接管时，先由操作者切 Position，等待新鲜观测稳定、当前位置保持点重新准备并出现新的 `READY_FOR_MISSION`，再切 Mission。短时丢靶先制动，持续丢靶后请求 Hold 并停止视觉参考。保持点准备需要 PX4 的全球位置；无 GPS 的纯室内方案需要其他任务触发接口。
 
-| 内容 | 参数 |
-|---|---|
-| 红色双灯条顶面中心 | Gazebo 世界 ENU `(5, 0, 1.5)` 米 |
-| 实心柱体 | 约 `0.4 × 0.4 × 1.475` 米，带碰撞 |
-| 柱顶装甲板 | `0.22 × 0.12 × 0.02` 米 |
-| 两灯条 | 中心距 `0.135` 米，长度 `0.055` 米 |
+## 观察和手动 Offboard
 
-地面和柱体已压暗，太阳与灯条材质保持原设置。亮背景在当前电脑兼容实现中会通过灰度提取，与灯条合并成大色块；仅压暗地面仍会受柱顶干扰。压暗两者后，静态画面已能用原配置提取两个红灯条并完成 PnP。亮背景地图备份和早期测试地图已删除。
+仅观察，不发送导航参考：
 
-## 3. 算法接入与改动
+```bash
+bash /home/hhkqwq/SRM_UAV/sim/start_simulation.sh
+```
 
-原算法仍位于 `/home/hhkqwq/SRM_UAV/PnP`。入口直接加载其中的检测、PnP、跟踪、视觉伺服和通信模块，原文件未修改。
-
-检测沿用原配置：`GRAY`、`ANY`、`LIGHT_L_MIN=25`、原颜色与几何阈值、`320×240` 输入。早期额外设置的 LAB/RED、高分辨率输入和 15 FPS 上限均已撤回。
-
-接入层处理以下差异：
-
-- **相机标定**：相机接入层启动时直接读取原 `PnP/config.py` 的图像尺寸、内参和五项畸变参数。当前为 `320×240`、`fx=302.11830698360654, fy=302.03599395976175, cx=163.3557244238438, cy=117.66487385855488`，畸变沿用原配置的 `(k1,k2,p1,p2,k3)`。利用 Gazebo 现有 `1280×960` 广角画面中的射线，重新采样出对应 OpenMV 视角、主点及畸变的图像；不再将广角整幅画面直接缩小。每个输出像素使用 `2×2` 子像素样本平均，减小采样锯齿。`/pnp/camera_info` 与这幅图像使用相同标定，图像时间戳保持不变。
-- **安装外参**：采用仿真相机相对机体的实际安装方向，机体 FRD 系平移为 `(0,0,+0.14)` 米。
-- **平台接口**：ROS 图像替代 OpenMV 采图，OpenCV 兼容层近似实现 OpenMV 图像接口；UART 替换为本机 MAVLink UDP，使用仿真时间对齐。
-- **诊断**：增加检测画面、CSV 和真值误差统计。Gazebo 目标位置只用于误差比较，不送入检测或 PnP；默认姿态来自 PX4。
-
-相机接入层为 `pnp_integration/camera_model.py` 和 `camera_bridge.py`，只处理图像、相机标定和时间戳，不读取目标或飞机真值。Gazebo 原始相机内参只用于确定输入射线，输出图像与 PnP 使用原 OpenMV 内参及畸变。原 PX4 相机模型和原 PnP 算法文件均不需要修改。`--algorithm-dir` 会同时传给相机接入层和算法，避免两者使用不同的配置。
-
-此处复现的是原标定定义的几何成像，不等于实物相机所有行为相同：电脑兼容层的颜色、连通域和矩形计算，以及 Gazebo 的曝光、光学模糊、噪声与 OpenMV 实机帧率仍存在差异。仿真的安装外参继续使用实际模型外参。原配置变化后需重启仿真。
-
-默认只观测，不发送导航速度。后续需要测试控制时仍使用同一入口：
+保留原手动 Offboard 方式：
 
 ```bash
 bash /home/hhkqwq/SRM_UAV/sim/start_simulation.sh --enable-control
 ```
 
-该选项允许原控制器发送速度参考，不会自动解锁或切换模式，Offboard 仍需手动进入。目前未完成动态闭环飞行验证。
+自行起飞到目标可见位置，程序预热后手动切 Offboard。此方式不准备 Mission 保持项。所有模式都保持相同检测配置；不要同时启动两个占用 UDP 14540 的算法进程。停止旧仿真后再启动新一轮。
 
-## 4. 验证 PnP 准确性
-
-先使用默认观测模式。手动飞到柱顶上方约 1 米，保持目标可见，按实际任务进行平移、转向和倾斜移动；在测试过程中或结束后运行：
+## 检查精度与收敛
 
 ```bash
 python3 /home/hhkqwq/SRM_UAV/sim/pnp_integration/analyze_log.py --latest --last-seconds 20
+python3 /home/hhkqwq/SRM_UAV/sim/pnp_integration/analyze_mission.py --latest
 ```
 
-上述命令统计最新日志末尾 20 秒仿真时间，窗口可以包含移动。建议对相近轨迹、速度和距靶高度进行前后对照，并同时比较有效率、误差和测量间断。悬停可作为补充基准，不替代移动测试。
+第一个命令比较定位输出与同一时刻真值。第二个检查最后 10 秒的真实水平误差、距靶高度误差、视觉接管与真实观测连续性；只有真值完整、持续处于视觉 Offboard 且误差达标才报告 `passed=true`。刚起飞、没有收敛或缺少真值时不会报告成功。
 
-高度应区分 `base_link` 世界坐标和 QGC 相对起飞高度。机体水平位于 `(5,0,2.64)` 时，相机距靶面约 `1.0` 米；程序按实际位姿计算真值，不必精确停在整数坐标。
+`HORIZONTAL_TARGET=True` 使用靶面水平先验与 PX4 曝光时刻姿态约束法向，降低少像素端点造成的高度波动。输出的该法向并非独立测得的靶板姿态；验证自由旋转精度时需关闭该选项。仿真真值仅用于统计；`--truth-attitude` 仅允许显式观察诊断，与控制 / Mission 不得并用。
 
-重点查看统计结果：
+日志位于 `sim/logs`：
 
-| 字段 | 看什么 |
-|---|---|
-| `valid_pose_rate` | 测试窗口内采样有效率，失检也要计入 |
-| `camera_position_error` | 滤波前相机系三维位置误差的 RMSE、P95、最大值，单位米 |
-| `camera_axis_error` | 右／下／前各轴的平均偏差和抖动 |
-| `max_abs_truth_time_difference_ms` | 图像与真值时间差，动态测试尤其需要关注 |
-| `relative_ned_error` | 加入 PX4 姿态和外参后的相对位置误差 |
+- `algorithm_*.log`：识别、遥测、保持项准备与接管状态。
+- `bridge_*.log`：相机桥接状态。
+- `pnp_sim_*.csv/json`：图像时间、四点、姿态、PnP 模式、控制输出、任务状态、真值误差与运行配置。
 
-`samples=0` 表示没有可用误差样本，不能理解为误差为零。将不同位置的有效率、偏差、RMSE/P95 和抖动，与自己的控制精度需求比较。
-
-现有 CSV 尚未完整统计旋转误差。小重投影误差或绿色检测框不能证明完整位姿准确：本次一个静态例子的位置误差约 `9.3 mm`、重投影约 `0.19 px`，靶板法向仍偏约 `34°`。姿态精度需另行比较真实旋转或法向夹角；单次静态结果也不能代表动态或实物精度。
-
-## 5. 整理后的文件
-
-`sim` 保留当前地图、统一启动入口、内部相机桥接、OpenMV 标定成像接入层、算法接入及日志分析模块和本说明。后续运行会重新生成 `logs`。
-
-已清理临时代码副本、自测脚本、测试图片、空采样日志、旧地图及重复说明。历史 Codex 工作区各保留一份 Markdown 简述；原工程、开发环境和已安装程序保留。
+运行模块和板端配置说明见 [PnP/README.md](/home/hhkqwq/SRM_UAV/PnP/README.md)。本次 70 项离线检查通过；实际悬停验证由用户自行进行。本次临时测试脚本和重复副本已清理，原有 CSV、JSON、飞行日志及文档均保留。

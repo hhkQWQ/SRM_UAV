@@ -15,6 +15,8 @@ class VisualServo:
         self.lost_since = None
         self.arrival_since = None
         self.generation = None
+        self.flight_generation = None
+        self.descent_allowed = False
         self.state = "DISABLED"
 
     def update(self, track, flight, now_ms, configured, enabled=None):
@@ -33,45 +35,91 @@ class VisualServo:
         if reason is not None:
             self.state, self.command, self.yaw = reason,(0.,0.,0.),None
             self.lost_since = self.arrival_since = None
+            self.descent_allowed = False
             return None
         if dt < 0 or dt > 0.25:
             self.command = (0.,0.,0.)
             self.state = "LOOP_STALE"
             self.lost_since = self.arrival_since = None
             self.yaw = None
+            self.descent_allowed = False
             return None
+        flight_generation = flight.get("generation")
+        if flight_generation != self.flight_generation:
+            self.flight_generation = flight_generation
+            self.command, self.yaw = (0.,0.,0.),None
+            self.arrival_since = self.lost_since = None
+            self.descent_allowed = False
         if self.yaw is None:
             self.yaw = flight["yaw"]
         if not flight.get("offboard"):
             # 启用后先用零速度预热；由操作者切入Offboard，避免进入条件循环依赖。
             self.state, self.command = "PRIMING",(0.,0.,0.)
             self.lost_since = self.arrival_since = None
+            self.descent_allowed = False
+            # 每次重新接管时锁定当时航向，避免使用任务开始前的旧yaw。
+            self.yaw = flight["yaw"]
             return self._output()
         p = track.get("position")
         if p is not None and (len(p) != 3 or not finite(p)):
             p = None
+        measurement_ms = track.get("measurement_ms")
+        age = track.get("age_ms")
+        if measurement_ms is not None:
+            age = now_ms-measurement_ms
+        if age is not None and not 0 <= age <= C.MAX_PREDICTION_MS:
+            p = None
+        changed = self.generation is not None and track.get("generation") != self.generation
         if track.get("generation") != self.generation:
             self.generation = track.get("generation")
             self.arrival_since = None
+            self.descent_allowed = False
         if p is not None and track.get("state") in ("MEASURED","PREDICTED"):
             self.lost_since = None
             ex,ey,ez = p[0],p[1],p[2]-C.TARGET_HEIGHT_M
+            horizontal_error = hypot2(ex,ey)
             vx,vy = _bounded_xy(C.KP_XY*ex,C.KP_XY*ey,C.MAX_SPEED_XY)
             vz = max(-C.MAX_SPEED_Z,min(C.MAX_SPEED_Z,C.KP_Z*ez))
+            measured = track["state"] == "MEASURED"
+            center,size = track.get("center"),track.get("size",0.)
+            image_safe = True
+            if center is not None:
+                margin = C.DESCENT_IMAGE_MARGIN_PX+size*0.5
+                image_safe = (margin <= center[0] <= C.IMAGE_WIDTH-margin and
+                              margin <= center[1] <= C.IMAGE_HEIGHT-margin)
+            if not measured or not image_safe or horizontal_error > C.DESCENT_XY_EXIT_M:
+                self.descent_allowed = False
+            elif horizontal_error <= C.DESCENT_XY_ENTER_M:
+                self.descent_allowed = True
+            # NED正z为下降。先对准再下降；缺测期竖直制动，不继续盲降。
+            if not measured or (vz > 0 and not self.descent_allowed):
+                vz = 0.
             desired = (vx,vy,vz)
-            arrived = (hypot2(ex,ey) <= C.ARRIVAL_XY_M and abs(ez) <= C.ARRIVAL_Z_M)
+            if changed:
+                desired = (0.,0.,0.)
+            arrived = (horizontal_error <= C.ARRIVAL_XY_M and abs(ez) <= C.ARRIVAL_Z_M)
             # 仅真实观测可建立/维持到位确认。
-            if arrived and track["state"] == "MEASURED":
+            if arrived and measured and not changed:
                 if self.arrival_since is None:
                     self.arrival_since = now_ms
             else:
                 self.arrival_since = None
             holding = self.arrival_since is not None and now_ms-self.arrival_since >= C.ARRIVAL_DWELL_MS
-            self.state = "HOLD" if holding else ("PREDICT" if track["state"] == "PREDICTED" else "ALIGN")
+            if changed:
+                self.state = "TARGET_CHANGED"
+            elif holding:
+                self.state = "HOLD"
+            elif not measured:
+                self.state = "PREDICT"
+            elif ez > C.ARRIVAL_Z_M and not self.descent_allowed:
+                self.state = "CENTERING"
+            else:
+                self.state = "ALIGN"
         else:
             if self.lost_since is None:
                 self.lost_since = now_ms
             self.arrival_since = None
+            self.descent_allowed = False
             elapsed = now_ms-self.lost_since
             if elapsed > C.LOST_BRAKE_MS:
                 self.state, self.command = "LOST_RELEASE",(0.,0.,0.)

@@ -1,5 +1,5 @@
-"""最小MAVLink1/2链路；仅请求遥测、发心跳/TIMESYNC/速度参考。
-不发送解锁、模式切换、参数写入；签名帧拒绝，需签名链路不适用。
+"""最小MAVLink1/2链路，支持显式启用后的任务协议及模式命令。
+默认仅遥测；不写参数。签名帧拒绝，需签名链路不适用。
 """
 import math
 import struct
@@ -7,7 +7,10 @@ import time
 import config as C
 from pose_solver import finite, norm, unit, quaternion_rotation
 
-CRC_EXTRA = {0:50,31:246,32:185,76:152,77:143,84:143,111:34,230:163}
+CRC_EXTRA = {0:50,31:246,32:185,33:104,39:254,40:230,41:28,42:28,
+             43:132,44:221,45:232,47:153,51:196,73:38,
+             76:152,77:143,84:143,111:34,230:163,242:104}
+EVENT_MESSAGES = (33,40,42,47,51,77,242)
 
 class Clock:
     def __init__(self):
@@ -112,6 +115,10 @@ class FlightLink:
         self.sequence = 0
         self.hb_us = -100000000
         self.armed = self.offboard = False
+        self.main_mode = self.sub_mode = 0
+        self.mission = False
+        self.mission_seq = None
+        self.events = []
         self.attitudes, self.velocities = [],[]
         self.estimator = None
         self.offset_us = None
@@ -158,6 +165,8 @@ class FlightLink:
         self.estimator = None
         self.offset_us, self.sync_count, self.pending_sync = None,0,None
         self.stream_index = 0
+        self.events = []
+        self.mission_seq = None
         self.queue = []
         self.cancel_setpoint()
 
@@ -174,9 +183,32 @@ class FlightLink:
             if self.target == (sysid,compid):
                 self.hb_us = now
                 self.armed = bool(base&128)
-                self.offboard = bool(base&1) and ((custom>>16)&255) == 6
+                self.main_mode = (custom>>16)&255 if base&1 else 0
+                self.sub_mode = (custom>>24)&255 if base&1 else 0
+                self.offboard = self.main_mode == 6
+                self.mission = self.main_mode == 4 and self.sub_mode == 4
         if self.target != (sysid,compid):
             return
+        # Mission/ACK可能与QGC共享链路；只交给本机或广播接收者。
+        recipient = None
+        if mid in (40,51):
+            p = padded(payload,5)
+            recipient = (p[2],p[3])
+        elif mid == 47:
+            p = padded(payload,4)
+            recipient = (p[0],p[1])
+        elif mid == 77:
+            p = padded(payload,10)
+            recipient = (p[8],p[9])
+        if recipient is not None and (recipient[0] not in (0,C.SOURCE_SYSTEM)
+                                      or recipient[1] not in (0,C.SOURCE_COMPONENT)):
+            return
+        if mid in EVENT_MESSAGES:
+            if len(self.events) >= 32:
+                self.events.pop(0)
+            self.events.append((mid,sysid,compid,payload,now))
+        if mid == 42:
+            self.mission_seq = struct.unpack("<H",padded(payload,2))[0]
         if mid == 31:
             values = struct.unpack("<I7f",padded(payload,32))
             boot,q,gyro = values[0],tuple(values[1:5]),tuple(values[5:8])
@@ -286,6 +318,8 @@ class FlightLink:
             yaw = math.atan2(r[1][0],r[0][0])
         return {"ready":reason == "OK","reason":reason,"armed":self.armed,
                 "offboard":self.offboard,"q":q,"yaw":yaw,
+                "mission":self.mission,"main_mode":self.main_mode,
+                "sub_mode":self.sub_mode,"mission_seq":self.mission_seq,
                 "velocity":self.velocities[-1][1] if self.velocities else None,
                 "generation":self.generation}
 
@@ -296,11 +330,60 @@ class FlightLink:
 
     def _queue(self, mid, payload):
         if len(self.queue) < 8:
-            self.queue.append([self._packet(mid,payload),0,self.clock.now_us(),False])
+            control = None
+            if mid == 76 and len(payload) >= 30:
+                command = struct.unpack("<H",payload[28:30])[0]
+                if command == 176:
+                    main_mode = struct.unpack("<f",payload[4:8])[0]
+                    control = "OFFBOARD" if main_mode == 6. else "MODE"
+                elif command == 400:
+                    control = "ARM"
+            self.queue.append([self._packet(mid,payload),0,self.clock.now_us(),False,control])
+            return True
+        return False
+
+    def drain_events(self):
+        events,self.events = self.events,[]
+        return events
+
+    def cancel_mission_transfer(self):
+        def upload(item):
+            packet = item[0]
+            return (packet[7]|packet[8]<<8|packet[9]<<16) in (39,44,73)
+        self.queue = [item for item in self.queue if not upload(item)]
+        if self.active is not None and self.active[1] == 0 and upload(self.active):
+            self.active = None
+
+    def send_message(self, mid, payload):
+        """显式启用导航后才允许外部任务管理器写入任务协议。"""
+        if not C.NAV_ENABLE or not self.connected(self.clock.now_us()):
+            return False
+        if mid not in (39,41,43,44,45,47,73):
+            return False
+        return self._queue(mid,payload)
+
+    def send_command(self, command, params):
+        """仅调用者明确启用导航时发送；ACK/心跳由调用者验证。"""
+        if (not C.NAV_ENABLE or not self.connected(self.clock.now_us())
+                or len(params) > 7 or not finite(params)):
+            return False
+        params = tuple(params)+(0.,)*(7-len(params))
+        payload = struct.pack("<7fHBBB",*(params+(command,self.target[0],self.target[1],0)))
+        return self._queue(76,payload)
+
+    def request_mode(self, main_mode, sub_mode=0):
+        # MAV_MODE_FLAG_CUSTOM_MODE_ENABLED；PX4 DO_SET_MODE 使用独立主/子模式。
+        return self.send_command(176,(1.,float(main_mode),float(sub_mode)))
 
     def cancel_setpoint(self):
         self.latest_setpoint = None
         if self.active is not None and self.active[3] and self.active[1] == 0:
+            self.active = None
+        self.cancel_offboard_requests()
+
+    def cancel_offboard_requests(self):
+        self.queue = [item for item in self.queue if item[4] != "OFFBOARD"]
+        if self.active is not None and len(self.active) > 4 and self.active[4] == "OFFBOARD" and self.active[1] == 0:
             self.active = None
 
     def send_velocity(self, velocity, yaw, now=None):
@@ -318,19 +401,24 @@ class FlightLink:
         payload = struct.pack("<I11fHBBB",stamp&0xffffffff,
                     0.,0.,0.,velocity[0],velocity[1],velocity[2],
                     0.,0.,0.,yaw,0.,mask,self.target[0],self.target[1],1)
-        self.latest_setpoint = [self._packet(84,payload),0,now,True]
+        self.latest_setpoint = [self._packet(84,payload),0,now,True,None]
         return True
 
     def _flush(self, now):
         if self.active is None:
-            if self.latest_setpoint is not None:
+            control = next((i for i,item in enumerate(self.queue) if item[4] is not None),None)
+            if control is not None:
+                self.active = self.queue.pop(control)
+            elif self.latest_setpoint is not None:
                 self.active,self.latest_setpoint = self.latest_setpoint,None
             elif self.queue:
                 self.active = self.queue.pop(0)
             else:
                 return
-        packet,position,created,is_setpoint = self.active
-        if position == 0 and is_setpoint and now-created > C.MAX_TX_AGE_MS*1000:
+        packet,position,created,is_setpoint = self.active[:4]
+        is_control = len(self.active) > 4 and self.active[4] is not None
+        if position == 0 and ((is_setpoint or is_control) and (not C.NAV_ENABLE or now-created > C.MAX_TX_AGE_MS*1000)
+                              or is_control and not self.connected(now)):
             self.active = None
             self.dropped += 1
             return

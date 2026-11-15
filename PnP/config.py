@@ -1,6 +1,7 @@
 """H7 Plus 标准固件；所有长度为 m，角度为 rad，时间见变量后缀。"""
 # 先观察；只有填妥模型/标定/外参并确认后才能启用导航。
 NAV_ENABLE = False
+MISSION_ENABLE = False  # 与NAV_ENABLE同时开启：Mission触发后自动视觉接管；须先准备保持任务项
 TARGET_POINTS_T_M = (
     (-0.0675, -0.0275, 0.0),  # 1 左上
     ( 0.0675, -0.0275, 0.0),  # 2 右上
@@ -34,12 +35,14 @@ MIN_EDGE_PX = 3.
 MIN_DEPTH_M, MAX_DEPTH_M = 0.10, 8.0
 MAX_REPROJECTION_PX = 2.0
 MAX_NORMAL_TILT_DEG = 35.0
+HORIZONTAL_TARGET = True  # 水平朝上靶面；以新鲜PX4姿态约束法向，竖直/倾斜靶须关闭
 
 CONFIRM_FRAMES, MAX_LOST_FRAMES = 3, 4
 MAX_PREDICTION_MS = 250
 TRACK_ALPHA, TRACK_BETA = 0.70, 0.20
 POSITION_ALPHA = 0.65
 POSITION_JUMP_M = 0.50
+POSE_CONFIRM_FRAMES = 3  # 无可用三维状态时，连续一致深度才可重新启用闭环
 
 # 以下为离线仿真起点，不是已完成实机整定的参数。
 TARGET_HEIGHT_M = 1.0
@@ -47,6 +50,8 @@ KP_XY, KP_Z = 0.45, 0.35
 MAX_SPEED_XY, MAX_SPEED_Z = 0.30, 0.15
 MAX_ACCEL_XY, MAX_ACCEL_Z = 0.50, 0.30
 ARRIVAL_XY_M, ARRIVAL_Z_M, ARRIVAL_DWELL_MS = 0.05, 0.05, 700
+DESCENT_XY_ENTER_M, DESCENT_XY_EXIT_M = 0.10, 0.16
+DESCENT_IMAGE_MARGIN_PX = 12.  # 目标包围范围到图像边缘的余量；下降前检查
 CONTROL_INTERVAL_MS = 50
 LOST_BRAKE_MS = 800
 
@@ -88,11 +93,18 @@ def readiness_errors():
     import math
     errors = []
     limits = (TARGET_HEIGHT_M,KP_XY,KP_Z,MAX_SPEED_XY,MAX_SPEED_Z,
-              MAX_ACCEL_XY,MAX_ACCEL_Z,ARRIVAL_XY_M,ARRIVAL_Z_M)
+              MAX_ACCEL_XY,MAX_ACCEL_Z,ARRIVAL_XY_M,ARRIVAL_Z_M,
+              DESCENT_XY_ENTER_M,DESCENT_XY_EXIT_M)
     if not all(math.isfinite(v) and v > 0 for v in limits):
         errors.append("CONTROL_LIMITS_INVALID")
     elif LOST_BRAKE_MS < 1000*max(MAX_SPEED_XY/MAX_ACCEL_XY,MAX_SPEED_Z/MAX_ACCEL_Z):
         errors.append("BRAKE_WINDOW_TOO_SHORT")
+    if (DESCENT_XY_ENTER_M > DESCENT_XY_EXIT_M or
+            DESCENT_XY_ENTER_M < ARRIVAL_XY_M or
+            not math.isfinite(DESCENT_IMAGE_MARGIN_PX) or
+            not 0 <= DESCENT_IMAGE_MARGIN_PX < min(IMAGE_WIDTH,IMAGE_HEIGHT)*0.5 or
+            POSE_CONFIRM_FRAMES < 2 or ARRIVAL_DWELL_MS <= 0):
+        errors.append("NAVIGATION_GATES_INVALID")
     if not MODEL_CONFIRMED or TARGET_POINTS_T_M is None:
         errors.append("MODEL_UNCONFIRMED")
     if not CALIBRATION_CONFIRMED:
