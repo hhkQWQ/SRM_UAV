@@ -1,0 +1,121 @@
+[INFO] [1794929446.938832817] [pnp_sim_algorithm]: TIMESYNC diagnostics=/home/hhkqwq/SRM_UAV/sim/logs/pnp_sim_20261117_233046_926687_sync.jsonl
+[INFO] [1794929446.939226262] [pnp_sim_algorithm]: Mode=mission_standby; CSV=/home/hhkqwq/SRM_UAV/sim/logs/pnp_sim_20261117_233046_926687.csv
+[INFO] [1794929446.939461810] [pnp_sim_algorithm]: Waiting for image, CameraInfo and Gazebo simulation clock
+[INFO] [1794929446.939619690] [pnp_sim_algorithm]: MISSION待命：手动起飞到可见标靶处并稳定悬停，等待 READY_FOR_MISSION，再手动选择 Mission。
+[INFO] [1794929446.949758614] [pnp_sim_algorithm]: Mission=WAIT_READY; error=None
+[WARN] [1794929446.950120702] [pnp_sim_algorithm]: No new image: keep start_camera_bridge.sh running and simulation playing
+[INFO] [1794929446.977564316] [pnp_sim_algorithm]: CameraInfo native=320x240; algorithm=(320, 240); scaled fx/fy/cx/cy=(302.11830698360654, 302.03599395976175, 163.3557244238438, 117.66487385855488); d=[0.09984656079919686, -0.23986524630434, -0.0007887596884331264, 0.00012132382106465136, 0.16915439320944928]; original detector configuration
+[INFO] [1794929447.067154354] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=HEARTBEAT_STALE control=True
+[INFO] [1794929448.084437320] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=TIME_UNSYNCED control=True
+[INFO] [1794929449.087012854] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=TIME_UNSYNCED control=True
+[INFO] [1794929450.087239318] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929451.126296978] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929452.164244917] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929453.186501501] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929454.193713251] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929455.225703566] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929456.234989807] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929457.293389321] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929458.294141604] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929459.323696186] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929460.323708366] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929461.336070504] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929462.099627785] [pnp_sim_algorithm]: Mission=BLOCKED_ESTIMATOR_UNREADY; error=ESTIMATOR_UNREADY
+[INFO] [1794929462.363480330] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929463.364925923] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929464.397016714] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929465.423485814] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929466.424760371] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929467.433830842] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929468.436434662] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929469.463679516] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929470.463927278] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=ESTIMATOR_UNREADY control=True
+[INFO] [1794929471.493657129] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929472.523725442] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929473.534493211] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929474.564531475] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929475.566863955] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929476.593468878] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929477.593844537] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929478.600488081] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929479.623421201] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929480.624115325] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929481.663684625] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929482.664704779] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929483.700898763] [pnp_sim_algorithm]: OK track=CENTER_ONLY p_C=(0.116,0.361,2.180)m err=0.011m flight=OK control=True
+[INFO] [1794929484.723572224] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929485.723731182] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929486.725784620] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.513,0.741,2.202)m err=0.064m flight=OK control=True
+[INFO] [1794929487.763986076] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929488.793610247] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929489.796293654] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.576,0.535,2.192)m err=0.052m flight=OK control=True
+[INFO] [1794929490.823500579] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929491.863998944] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929492.893455254] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929493.894238742] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929494.923974927] [pnp_sim_algorithm]: NO_PAIR track=CENTER_ONLY p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929495.925985489] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.547,0.581,2.190)m err=0.018m flight=OK control=True
+[INFO] [1794929496.965942188] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929497.965896239] [pnp_sim_algorithm]: OK track=CENTER_ONLY p_C=(0.529,0.787,2.439)m err=0.105m flight=OK control=True
+[INFO] [1794929498.967579502] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929499.995365150] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929501.027542013] [pnp_sim_algorithm]: OK track=ACQUIRING p_C=(0.423,0.786,2.320)m err=0.004m flight=OK control=True
+[INFO] [1794929502.065676578] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.454,0.241,2.099)m err=0.036m flight=OK control=True
+[INFO] [1794929503.039704428] [pnp_sim_algorithm]: Mission=WAIT_STABLE_TARGET; error=None
+[INFO] [1794929503.066489712] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.513,0.516,2.094)m err=0.082m flight=OK control=True
+[INFO] [1794929504.067163566] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.499,0.327,2.089)m err=0.047m flight=OK control=True
+[INFO] [1794929504.299531461] [pnp_sim_algorithm]: Mission=UPLOADING; error=None
+[INFO] [1794929504.425383539] [pnp_sim_algorithm]: Mission=READY_FOR_MISSION; error=None
+[INFO] [1794929505.095363752] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.453,0.274,2.065)m err=0.025m flight=OK control=True
+[INFO] [1794929505.139742626] [pnp_sim_algorithm]: Mission=MISSION_SELECTED; error=None
+[INFO] [1794929506.095785768] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.492,0.293,2.088)m err=0.058m flight=OK control=True
+[INFO] [1794929507.095994731] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.515,0.316,2.072)m err=0.058m flight=OK control=True
+[INFO] [1794929508.097615067] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.511,0.336,1.989)m err=0.016m flight=OK control=True
+[INFO] [1794929508.125536735] [pnp_sim_algorithm]: Mission=VISION_ACTIVE; error=None
+[INFO] [1794929509.125746025] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.513,0.370,1.999)m err=0.021m flight=OK control=True
+[INFO] [1794929510.140960231] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.276,0.155,1.986)m err=0.012m flight=OK control=True
+[INFO] [1794929511.165567566] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.111,-0.004,1.962)m err=0.036m flight=OK control=True
+[INFO] [1794929512.195652470] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.052,-0.088,2.063)m err=0.064m flight=OK control=True
+[INFO] [1794929513.196176497] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.023,-0.129,1.884)m err=0.011m flight=OK control=True
+[INFO] [1794929514.225480678] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.019,-0.169,1.799)m err=0.060m flight=OK control=True
+[INFO] [1794929515.225618964] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.014,-0.176,1.606)m err=0.018m flight=OK control=True
+[INFO] [1794929516.229607078] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.010,-0.161,1.423)m err=0.017m flight=OK control=True
+[INFO] [1794929517.255562565] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.007,-0.148,1.292)m err=0.005m flight=OK control=True
+[INFO] [1794929518.293821485] [pnp_sim_algorithm]: NO_PAIR track=CENTER_ONLY p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929518.805203920] [pnp_sim_algorithm]: Mission=BLOCKED_LOST_RELEASE; error=LOST_RELEASE
+[INFO] [1794929519.333852886] [pnp_sim_algorithm]: NO_PAIR track=CENTER_ONLY p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929520.333907466] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929521.336021015] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929522.364330698] [pnp_sim_algorithm]: NO_PAIR track=PREDICTED p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929523.366130571] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.005,-0.086,1.256)m err=0.017m flight=OK control=True
+[INFO] [1794929524.406160651] [pnp_sim_algorithm]: NO_PAIR track=PREDICTED p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929525.434191463] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929526.437656308] [pnp_sim_algorithm]: NO_PAIR track=PREDICTED p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929527.497553499] [pnp_sim_algorithm]: NO_PAIR track=PREDICTED p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929528.534246158] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929529.537579057] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929530.577881971] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929531.596702730] [pnp_sim_algorithm]: NO_PAIR track=PREDICTED p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929532.638108575] [pnp_sim_algorithm]: OK track=CENTER_ONLY p_C=(0.016,-0.138,1.168)m err=0.003m flight=TIME_UNSYNCED control=True
+[INFO] [1794929533.694063232] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929534.764098163] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929535.764587110] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929536.804648042] [pnp_sim_algorithm]: NO_PAIR track=PREDICTED p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929537.835361243] [pnp_sim_algorithm]: NO_PAIR track=PREDICTED p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929538.866519443] [pnp_sim_algorithm]: OK track=CENTER_ONLY p_C=(0.001,-0.086,1.236)m err=0.004m flight=TIME_UNSYNCED control=True
+[INFO] [1794929539.894216194] [pnp_sim_algorithm]: NO_PAIR track=CENTER_ONLY p_C=(none)m err=n/am flight=TIME_UNSYNCED control=True
+[INFO] [1794929540.906942435] [pnp_sim_algorithm]: NO_PAIR track=LOST p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929541.933928043] [pnp_sim_algorithm]: NO_PAIR track=CENTER_ONLY p_C=(none)m err=n/am flight=OK control=True
+[INFO] [1794929542.935791359] [pnp_sim_algorithm]: OK track=MEASURED p_C=(-0.016,-0.141,1.475)m err=0.004m flight=OK control=True
+[INFO] [1794929543.976451448] [pnp_sim_algorithm]: OK track=MEASURED p_C=(-0.038,-0.133,1.661)m err=0.014m flight=OK control=True
+[INFO] [1794929544.995567239] [pnp_sim_algorithm]: OK track=MEASURED p_C=(-0.035,-0.121,1.798)m err=0.019m flight=OK control=True
+[INFO] [1794929546.011830184] [pnp_sim_algorithm]: OK track=CENTER_ONLY p_C=(-0.050,-0.155,1.924)m err=0.020m flight=TIME_UNSYNCED control=True
+[INFO] [1794929547.035867097] [pnp_sim_algorithm]: OK track=CENTER_ONLY p_C=(-0.025,-0.173,1.943)m err=0.012m flight=TIME_UNSYNCED control=True
+[INFO] [1794929548.066071178] [pnp_sim_algorithm]: OK track=CENTER_ONLY p_C=(-0.022,-0.167,2.011)m err=0.031m flight=TIME_UNSYNCED control=True
+[INFO] [1794929549.070891043] [pnp_sim_algorithm]: OK track=CENTER_ONLY p_C=(-0.023,-0.175,2.039)m err=0.033m flight=TIME_UNSYNCED control=True
+[INFO] [1794929550.095615160] [pnp_sim_algorithm]: OK track=MEASURED p_C=(-0.009,-0.167,2.064)m err=0.038m flight=OK control=True
+[INFO] [1794929551.106268426] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.004,-0.136,2.064)m err=0.029m flight=OK control=True
+[INFO] [1794929552.135602475] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.001,-0.134,1.962)m err=0.076m flight=OK control=True
+[INFO] [1794929553.165898739] [pnp_sim_algorithm]: OK track=MEASURED p_C=(-0.023,-0.119,2.064)m err=0.025m flight=OK control=True
+[INFO] [1794929554.175724089] [pnp_sim_algorithm]: OK track=MEASURED p_C=(-0.016,-0.109,2.063)m err=0.030m flight=OK control=True
+[INFO] [1794929555.178838089] [pnp_sim_algorithm]: OK track=MEASURED p_C=(0.011,-0.102,2.063)m err=0.036m flight=OK control=True

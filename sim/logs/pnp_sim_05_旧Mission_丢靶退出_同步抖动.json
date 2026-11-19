@@ -94,6 +94,26 @@
     "mission": true
   },
   "mission_policy": "Pilot flies and enters Mission; a current-PX4-position loiter is staged only after stable visual acquisition. Visual handover uses PnP and PX4 telemetry.",
+  "sync_diagnostics": {
+    "path": "/home/hhkqwq/SRM_UAV/sim/logs/pnp_sim_20261117_233046_926687_sync.jsonl",
+    "limits": {
+      "interval_us": 1000000,
+      "max_rtt_us": 30000,
+      "max_jitter_us": 5000,
+      "min_samples": 3,
+      "timeout_us": 5000000,
+      "reset_innovation_us": 50000,
+      "buffer_size": 128
+    },
+    "source": {
+      "algorithm_dir": "/home/hhkqwq/SRM_UAV/PnP",
+      "flight_link_sha256": "99bb761550bab0fdc5901f8488a6d2cf093350db56e18fec1b3702f8865d3bcb",
+      "config_sha256": "b86c8102c175c3396e5812ce968ae5af9b09daf13c3cce88206e16c130d161b6",
+      "observer_sha256": "19ac818b8124bff2b732f03c5a7b344a4036b10c0d554e5478a28fa081efea3d"
+    },
+    "policy": "Diagnostic events and independent 1 Hz snapshots; synchronization decisions unchanged",
+    "time_observation": "UART/socket write and parser processing times; not wire/hardware arrival times"
+  },
   "camera_calibration": {
     "native_size": [
       320,

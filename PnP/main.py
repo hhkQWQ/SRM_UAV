@@ -1,4 +1,4 @@
-"""将本目录运行模块放到OpenMV根目录；config默认仅观察。"""
+"""OpenMV室内视觉任务：人工切Offboard后开始识别与导航。"""
 import math
 import os
 import config as C
@@ -6,10 +6,8 @@ from pose_solver import (PlanarPoseSolver, finite, rotation_valid, local_to_came
                          relative_measurement, quaternion_rotation, mv,
                          camera_down_normal)
 from target_tracker import TargetTracker
-from visual_servo import VisualServo
 from flight_link import Clock, FlightLink
-from mission_handover import MissionHandover
-from mission_standby import MissionStandby
+from visual_servo import VisualServo
 
 # 只记录诊断数据，不改变视觉、跟踪或导航参数。
 POSE_LOG_ENABLE = True
@@ -30,7 +28,9 @@ POSE_LOG_FIELDS = (
     "track", "nav", "flight", "track_age_ms", "observation_age_ms",
     "configured", "config_errors", "color",
 ) + tuple("%s%d_px" % (axis, i) for i in range(1, 5) for axis in ("u", "v")) + (
-    "pnp_mode", "mission_prepare",
+    "pnp_mode", "vision_enabled", "control_time_us",
+    "control_track", "armed", "offboard", "main_mode", "sub_mode",
+    "setpoint_submitted", "command_vn_mps", "command_ve_mps", "command_vd_mps",
 )
 
 
@@ -139,7 +139,9 @@ class PoseCSVLogger:
 
 def pose_log_row(frame_id, stamp, now, capture_us, pre_log_us, fps,
                  solve_us, q, pose, relative, track, velocity, flight,
-                 nav_state, points, color, mission_prepare=None):
+                 nav_state, points, color,
+                 vision_enabled=True, control_time_us=None, control_track=None,
+                 output=None, setpoint_submitted=False):
     pose_valid = bool(pose and pose.get("valid"))
     p = pose.get("position") if pose_valid else None
     rotation = pose.get("rotation") if pose_valid else None
@@ -165,7 +167,7 @@ def pose_log_row(frame_id, stamp, now, capture_us, pre_log_us, fps,
         "MODEL_MISSING" if C.TARGET_POINTS_T_M is None else "NO_PAIR")
     measurement_ms = track.get("measurement_ms")
     return (
-        frame_id, stamp, now, capture_us*.001, pre_log_us*.001, fps,
+        frame_id, stamp, now, None if capture_us is None else capture_us*.001, pre_log_us*.001, fps,
         None if solve_us is None else solve_us*.001, q is not None,
     ) + _values(q, 4) + _values(attitude_rpy_deg(q), 3) + (
         pose_valid, pose_reason,
@@ -179,8 +181,12 @@ def pose_log_row(frame_id, stamp, now, capture_us, pre_log_us, fps,
         None if measurement_ms is None else now//1000-measurement_ms,
         is_configured, "|".join(C.readiness_errors()), color,
     ) + ((None,) * 8 if points is None else tuple(v for point in points for v in point)) + (
-        pose.get("mode") if pose else None, mission_prepare,
-    )
+        pose.get("mode") if pose else None,
+        vision_enabled, control_time_us,
+        control_track.get("state") if control_track else None,
+        flight.get("armed"), flight.get("offboard"),
+        flight.get("main_mode"), flight.get("sub_mode"), setpoint_submitted,
+    ) + _values(output.get("velocity") if output else None, 3)
 
 
 def terminal_report(fps, position, q, solve_mean_ms, solve_peak_ms):
@@ -201,6 +207,75 @@ def configured():
     return (not C.readiness_errors() and rotation_valid(C.R_BC)
             and C.T_BC_M is not None and len(C.T_BC_M) == 3 and finite(C.T_BC_M))
 
+def vision_enabled(flight):
+    """同一模式门控供OpenMV和仿真使用；观察模式始终识别。"""
+    return (not C.NAV_ENABLE or
+            bool(flight.get("ready") and flight.get("armed") and flight.get("offboard")))
+
+
+def process_image(img, stamp, solver, tracker, detector, clock, link,
+                  previous=None, previous_color=None, vision_active=True):
+    """共享识别、PnP、坐标变换和跟踪；图像与计时接口由平台提供。"""
+    pair,color = None,None
+    if vision_active:
+        red,blue = detector.detect_lights(img)
+        debug = img if C.DEBUG_MODE >= 2 else None
+        rp = detector.find_best_pair(red,debug) if C.TARGET_COLOR != "BLUE" else None
+        bp = detector.find_best_pair(blue,debug) if C.TARGET_COLOR != "RED" else None
+        pair,color = detector.select_best_pair(rp,bp)
+    if link:
+        link.poll()
+    q = link.attitude_at(stamp) if link else None
+    velocity = link.velocity_at(stamp) if link else None
+    detection,pose,relative,points,spent = None,None,None,None,None
+    if pair is not None:
+        cx,cy,_,_,w,h = detector.get_pair_geometry(pair)
+        detection = {"center":detector.pair_center(pair),"color":color,"size":float(max(w,h))}
+        if solver is not None:
+            before = clock.now_us()
+            hint = previous if previous_color == color else None
+            points = detector.get_pair_points(pair)
+            normal = camera_down_normal(q,C.R_BC) if C.HORIZONTAL_TARGET and q is not None else None
+            pose = solver.solve(points,hint,normal_camera=normal)
+            spent = clock.now_us()-before
+            if pose["valid"]:
+                detection["center"] = pose["center"]
+                previous,previous_color = pose,color
+                if configured() and q is not None:
+                    relative = relative_measurement(pose,q,C.R_BC,C.T_BC_M)
+    track = tracker.update(detection,stamp//1000,relative,velocity)
+    if not vision_active:
+        track["state"] = "IDLE"
+    return ({"detection":detection,"pose":pose,"relative":relative,"points":points,
+             "track":track,"color":color,"solve_us":spent,"stamp_us":stamp,
+             "q":q,"velocity":velocity,"vision_enabled":vision_active},previous,previous_color)
+
+
+def update_control(track, flight, stamp, now, servo, link):
+    """共享延迟补偿、控制更新和发送/释放逻辑，不增加独立接管状态。"""
+    control_track = dict(track)
+    delay = max(0.,(now-stamp)*1e-6)
+    if track.get("position") is not None:
+        current_v = flight.get("velocity")
+        if current_v is not None:
+            control_track["position"] = tuple(track["position"][i]-current_v[i]*delay for i in range(3))
+        if track.get("age_ms") is None or track["age_ms"]+delay*1000 > C.MAX_PREDICTION_MS:
+            control_track["position"],control_track["state"] = None,"LOST"
+    previous_nav = servo.state
+    output = servo.update(control_track,flight,now//1000,configured())
+    submitted = False
+    if link:
+        if output is None or output.get("velocity") is None:
+            link.cancel_setpoint()
+            if (servo.state in ("LOST_RELEASE","LOOP_STALE") and servo.state != previous_nav
+                    and flight.get("ready") and flight.get("armed")
+                    and flight.get("offboard") and flight.get("local_position_ready")):
+                link.request_mode(3,0)
+        else:
+            submitted = link.send_velocity(output["velocity"],output["yaw"],now)
+    return control_track,output,submitted
+
+
 def run():
     import sensor
     import armor_detect as detector
@@ -216,89 +291,53 @@ def run():
     solver = build_solver()
     tracker,servo = TargetTracker(),VisualServo()
     link = FlightLink(clock=clock) if C.LINK_ENABLE else None
-    mission = MissionHandover() if C.MISSION_ENABLE else None
-    standby = MissionStandby(link) if mission and link else None
     nav_state = "DISABLED"
     last_report,last_control = clock.now_us(),-10000000
     logger = PoseCSVLogger(start_us=last_report)
     frames,solves,solve_sum,solve_peak,frame_id = 0,0,0,0,0
     previous,previous_color = None,None
     generation = link.generation if link else 0
+    was_vision_active = False
+    control_track,output,setpoint_submitted,control_time = None,None,False,None
     try:
         while True:
             start = clock.now_us()
             if link:
                 link.poll(service_sync=True)
                 if generation != link.generation:
-                    tracker,servo = TargetTracker(),VisualServo()
-                    previous = None
+                    tracker = TargetTracker()
+                    previous,previous_color = None,None
                     generation = link.generation
             capture_start = clock.now_us()
+            before_flight = link.state(capture_start) if link else {}
+            vision_active = vision_enabled(before_flight)
+            if vision_active != was_vision_active:
+                tracker = TargetTracker()
+                previous,previous_color = None,None
+                was_vision_active = vision_active
             img = sensor.snapshot()
             capture_end = clock.now_us()
             stamp = (capture_start+capture_end)//2-C.CAMERA_CAPTURE_DELAY_US
-            red,blue = detector.detect_lights(img)
-            debug = img if C.DEBUG_MODE >= 2 else None
-            rp = detector.find_best_pair(red,debug) if C.TARGET_COLOR != "BLUE" else None
-            bp = detector.find_best_pair(blue,debug) if C.TARGET_COLOR != "RED" else None
-            pair,color = detector.select_best_pair(rp,bp)
+            result,previous,previous_color = process_image(
+                img,stamp,solver,tracker,detector,clock,link,
+                previous,previous_color,vision_active)
+            q,velocity = result["q"],result["velocity"]
+            detection,pose,relative,points = (result[key] for key in ("detection","pose","relative","points"))
+            track,color,spent = result["track"],result["color"],result["solve_us"]
+            if spent is not None:
+                solves += 1
+                solve_sum += spent
+                solve_peak = max(solve_peak,spent)
             if link:
                 link.poll()
-            q = link.attitude_at(stamp) if link else None
-            velocity = link.velocity_at(stamp) if link else None
-            detection,pose,relative,points,spent = None,None,None,None,None
-            if pair is not None:
-                cx,cy,_,_,w,h = detector.get_pair_geometry(pair)
-                center = detector.pair_center(pair)
-                detection = {"center":center,"color":color,"size":float(max(w,h))}
-                if solver is not None:
-                    before = clock.now_us()
-                    hint = previous if previous_color == color else None
-                    points = detector.get_pair_points(pair)
-                    normal = (camera_down_normal(q,C.R_BC)
-                              if C.HORIZONTAL_TARGET and q is not None else None)
-                    pose = solver.solve(points,hint,normal_camera=normal)
-                    spent = clock.now_us()-before
-                    solves += 1
-                    solve_sum += spent
-                    solve_peak = max(solve_peak,spent)
-                    if pose["valid"]:
-                        detection["center"] = pose["center"]
-                        previous,previous_color = pose,color
-                        if configured() and q is not None:
-                            relative = relative_measurement(pose,q,C.R_BC,C.T_BC_M)
-            track = tracker.update(detection,stamp//1000,relative,velocity)
             now = clock.now_us()
             flight = link.state(now) if link else {"ready":False,"reason":"LINK_DISABLED"}
             if now-last_control >= C.CONTROL_INTERVAL_MS*1000:
-                control_track = dict(track)
-                delay = max(0.,(now-stamp)*1e-6)
-                if track["position"] is not None:
-                    current_v = flight.get("velocity")
-                    if current_v is not None:
-                        control_track["position"] = tuple(track["position"][i]-current_v[i]*delay for i in range(3))
-                    if (track["age_ms"] is None or track["age_ms"]+delay*1000 > C.MAX_PREDICTION_MS):
-                        control_track["position"],control_track["state"] = None,"LOST"
-                if mission is not None:
-                    staging = None
-                    if standby:
-                        staging = standby.update(control_track,flight,now,configured(),handover=mission)
-                    output = mission.update(control_track,flight,now//1000,configured(),
-                                            mission_prepared=bool(staging and staging["ready"]))
-                    if standby and mission.locked:
-                        standby.update(control_track,flight,now,configured(),events=[],handover=mission)
-                    nav_state = mission.state
-                else:
-                    output = servo.update(control_track,flight,now//1000,configured())
-                    nav_state = servo.state
-                if link:
-                    if output and output.get("request_mode") is not None:
-                        link.request_mode(*output["request_mode"])
-                    if output is None or output.get("velocity") is None:
-                        link.cancel_setpoint()
-                    else:
-                        link.send_velocity(output["velocity"],output["yaw"],now)
+                control_track,output,setpoint_submitted = update_control(
+                    track,flight,stamp,now,servo,link)
+                nav_state = servo.state
                 last_control = now
+                control_time = now
             if link:
                 link.poll()
             if C.DEBUG_MODE:
@@ -322,7 +361,8 @@ def run():
                         frame_id, stamp, pre_log_end, capture_end-capture_start,
                         pre_log_end-start, (frames+1)/seconds, spent, q, pose,
                         relative, track, velocity, flight, nav_state, points, color,
-                        standby.state if standby else None)
+                        vision_active, control_time, control_track,
+                        output, setpoint_submitted)
                     logger.write(row, pre_log_end)
                 except Exception as error:
                     logger.fail(error)
@@ -333,8 +373,8 @@ def run():
                 print(terminal_report(frames/seconds, track["position"], q,
                                       solve_sum/solves*.001 if solves else None,
                                       solve_peak*.001 if solves else None)
-                      + " nav=%s mission_prepare=%s" %
-                      (nav_state,standby.state if standby else "OFF"))
+                      + " nav=%s track=%s vision=%s flight=%s" %
+                      (nav_state,track["state"],vision_active,flight["reason"]))
                 frames,solves,solve_sum,solve_peak = 0,0,0,0
                 last_report = end
                 detector.reset_stats()

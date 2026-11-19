@@ -316,12 +316,16 @@ class FlightLink:
         if q is not None:
             r = quaternion_rotation(q)
             yaw = math.atan2(r[1][0],r[0][0])
+        # ESTIMATOR_POS_HORIZ_REL(8) + ESTIMATOR_POS_VERT_ABS(32)。
+        # 仅供室内故障退出请求Position；不要求全球位置标志。
+        local_position_ready = (reason == "OK" and self.estimator is not None
+                                and (self.estimator[2]&40) == 40)
         return {"ready":reason == "OK","reason":reason,"armed":self.armed,
                 "offboard":self.offboard,"q":q,"yaw":yaw,
                 "mission":self.mission,"main_mode":self.main_mode,
                 "sub_mode":self.sub_mode,"mission_seq":self.mission_seq,
                 "velocity":self.velocities[-1][1] if self.velocities else None,
-                "generation":self.generation}
+                "generation":self.generation,"local_position_ready":local_position_ready}
 
     def _packet(self, mid, payload):
         packet = pack_message(mid,payload,self.sequence,C.SOURCE_SYSTEM,C.SOURCE_COMPONENT)

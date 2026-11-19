@@ -3,14 +3,16 @@ set -eo pipefail
 
 bundle_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 px4_dir=/home/hhkqwq/PX4-Autopilot
+for option in "$@"; do
+  if [[ "$option" == --mission || "$option" == --mission=* ]]; then
+    printf '%s\n' '--mission 已移除：请在 Position 中预热后手动切 Offboard；仅观察使用 --observe。' >&2
+    exit 2
+  fi
+done
 run_tag="$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$bundle_dir/logs"
 bridge_log="$bundle_dir/logs/bridge_${run_tag}.log"
 algorithm_log="$bundle_dir/logs/algorithm_${run_tag}.log"
-mission_option=0
-for option in "$@"; do
-  if [[ "$option" == --mission ]]; then mission_option=1; fi
-done
 child_groups=()
 
 cleanup() {
@@ -74,9 +76,7 @@ child_groups+=("$!")
 
 printf '相机桥接日志：%s\n算法日志：%s\n' "$bridge_log" "$algorithm_log"
 printf 'PX4、Gazebo、桥接和算法由本终端一起启动；相机窗口选择 /pnp/debug_image。\n'
-if [ "$mission_option" -eq 1 ]; then
-  printf 'Mission视觉模式：等待手动起飞并粗导航，出现 READY_FOR_MISSION 后手动切 Mission。\n'
-fi
+printf '导航默认沿用 PnP/config.py：Position 中 PRIMING 后等待至少约 1.2 秒，手动切 Offboard；仅观察使用 --observe。\n'
 
 cd "$px4_dir"
 source /home/hhkqwq/px4-venv/bin/activate

@@ -1,7 +1,7 @@
 """H7 Plus 标准固件；所有长度为 m，角度为 rad，时间见变量后缀。"""
-# 先观察；只有填妥模型/标定/外参并确认后才能启用导航。
-NAV_ENABLE = False
-MISSION_ENABLE = False  # 与NAV_ENABLE同时开启：Mission触发后自动视觉接管；须先准备保持任务项
+# 人工切Offboard触发；Position中仅零速度预热，不自动解锁、起飞或切Offboard。
+# 只观察时设NAV_ENABLE=False；真机仍须核实模型/标定/外参和MTF-02融合。
+NAV_ENABLE = True
 TARGET_POINTS_T_M = (
     (-0.0675, -0.0275, 0.0),  # 1 左上
     ( 0.0675, -0.0275, 0.0),  # 2 右上

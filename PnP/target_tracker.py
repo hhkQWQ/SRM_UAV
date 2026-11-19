@@ -127,9 +127,9 @@ class TargetTracker:
                   and (measured or velocity_available))
         if not usable:
             self.p = None
+        # 尚在确认中心或只有二维中心时，都属于数据不足的ACQUIRING。
         state = "MEASURED" if measured else ("PREDICTED" if usable else
-                ("CENTER_ONLY" if self.center is not None else
-                 ("ACQUIRING" if self.pending is not None else "LOST")))
+                ("ACQUIRING" if self.center is not None or self.pending is not None else "LOST"))
         return {"state":state, "position":self.p if usable else None,
                 "center":self.center, "size":self.size, "color":self.color, "age_ms":age,
                 "measurement_ms":self.measurement_ms, "generation":self.generation,

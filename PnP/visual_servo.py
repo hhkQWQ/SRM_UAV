@@ -53,12 +53,17 @@ class VisualServo:
         if self.yaw is None:
             self.yaw = flight["yaw"]
         if not flight.get("offboard"):
-            # 启用后先用零速度预热；由操作者切入Offboard，避免进入条件循环依赖。
-            self.state, self.command = "PRIMING",(0.,0.,0.)
+            # Position中只发送零速度预热；不自动切Offboard。
+            self.command = (0.,0.,0.)
             self.lost_since = self.arrival_since = None
             self.descent_allowed = False
+            self.generation = None
             # 每次重新接管时锁定当时航向，避免使用任务开始前的旧yaw。
             self.yaw = flight["yaw"]
+            if flight.get("main_mode") != 3:
+                self.state = "WAIT_OFFBOARD"
+                return None
+            self.state = "PRIMING"
             return self._output()
         p = track.get("position")
         if p is not None and (len(p) != 3 or not finite(p)):
@@ -67,7 +72,7 @@ class VisualServo:
         age = track.get("age_ms")
         if measurement_ms is not None:
             age = now_ms-measurement_ms
-        if age is not None and not 0 <= age <= C.MAX_PREDICTION_MS:
+        if age is None or not 0 <= age <= C.MAX_PREDICTION_MS:
             p = None
         changed = self.generation is not None and track.get("generation") != self.generation
         if track.get("generation") != self.generation:
@@ -125,7 +130,7 @@ class VisualServo:
                 self.state, self.command = "LOST_RELEASE",(0.,0.,0.)
                 return None  # 不再发送；由PX4已配置的Offboard丢失处置接管
             desired = (0.,0.,0.)
-            self.state = "BRAKING"
+            self.state = "ACQUIRING" if track.get("state") == "ACQUIRING" else "BRAKING"
         dx,dy = _bounded_xy(desired[0]-self.command[0],desired[1]-self.command[1],C.MAX_ACCEL_XY*dt)
         dz = max(-C.MAX_ACCEL_Z*dt,min(C.MAX_ACCEL_Z*dt,desired[2]-self.command[2]))
         self.command = (self.command[0]+dx,self.command[1]+dy,self.command[2]+dz)

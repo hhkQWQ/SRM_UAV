@@ -1,5 +1,0 @@
-[INFO] [1794733874.499904515] [ros_gz_bridge]: Creating GZ->ROS Bridge: [/world/pnp_pillar/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image (gz.msgs.Image) -> /world/pnp_pillar/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image (sensor_msgs/msg/Image)] (Lazy 0)
-[INFO] [1794733874.500925237] [ros_gz_bridge]: Creating GZ->ROS Bridge: [/world/pnp_pillar/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info (gz.msgs.CameraInfo) -> /world/pnp_pillar/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info (sensor_msgs/msg/CameraInfo)] (Lazy 0)
-[INFO] [1794733874.685190980] [pnp_openmv_camera]: OpenMV camera 320x240; fx/fy/cx/cy=(302.11830698360654, 302.03599395976175, 163.3557244238438, 117.66487385855488); D=[0.09984656079919686, -0.23986524630434, -0.0007887596884331264, 0.00012132382106465136, 0.16915439320944928]; calibration=/home/hhkqwq/SRM_UAV/PnP/config.py
-[INFO] [1794733876.163211706] [pnp_openmv_camera]: Gazebo source 1280x960; calibrated image mapping ready; target truth is not used
-[INFO] [1794734089.056233131] [rclcpp]: signal_handler(SIGINT/SIGTERM)
