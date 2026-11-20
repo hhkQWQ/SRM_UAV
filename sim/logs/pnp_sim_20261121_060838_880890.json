@@ -1,0 +1,264 @@
+{
+  "schema_version": 2,
+  "implementation": "shared_pnp_communication_v2",
+  "clock": "Gazebo simulation microseconds; remote=local+offset_us",
+  "log_interval_ms": 200,
+  "control_config": {
+    "TARGET_HEIGHT_M": 1.0,
+    "KP_XY": 0.45,
+    "KP_Z": 0.35,
+    "MAX_SPEED_XY": 0.3,
+    "MAX_SPEED_Z": 0.15,
+    "MAX_ACCEL_XY": 0.5,
+    "MAX_ACCEL_Z": 0.3,
+    "CONTROL_INTERVAL_MS": 50,
+    "LOST_BRAKE_MS": 800,
+    "MAX_PREDICTION_MS": 250,
+    "ARRIVAL_XY_M": 0.05,
+    "ARRIVAL_Z_M": 0.05,
+    "ARRIVAL_DWELL_MS": 700
+  },
+  "timing_limits": {
+    "SYNC_INTERVAL_MS": 1000,
+    "SYNC_RECOVERY_INTERVAL_MS": 200,
+    "SYNC_MAX_RTT_MS": 30,
+    "SYNC_MAX_JITTER_US": 5000,
+    "SYNC_MIN_SAMPLES": 3,
+    "SYNC_TIMEOUT_MS": 5000,
+    "SYNC_WINDOW_MS": 5000,
+    "SYNC_WINDOW_SIZE": 9,
+    "SYNC_RESET_US": 50000,
+    "ATTITUDE_EXTRAPOLATE_MS": 30,
+    "TELEMETRY_TIMEOUT_MS": 200,
+    "MAX_TX_AGE_MS": 100
+  },
+  "camera": {
+    "intrinsics": [
+      302.11830698360654,
+      302.03599395976175,
+      163.3557244238438,
+      117.66487385855488
+    ],
+    "distortion": [
+      0.09984656079919686,
+      -0.23986524630434,
+      -0.0007887596884331264,
+      0.00012132382106465136,
+      0.16915439320944928
+    ],
+    "R_BC": [
+      [
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        -1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "T_BC_M": [
+      0.14,
+      0.0,
+      0.04
+    ],
+    "capture_delay_us": 0
+  },
+  "transmit_note": "WRITTEN is a completed local write, not a PX4 execution acknowledgement",
+  "source_sha256": {
+    "config": "7ad9b68ef4805d1ee8ac6ab5fe949d55548515398c5b0ba1b1abbdfdbcb095e8",
+    "main": "029ef63c08e7282491b2a0d4802a1214940a5169e90dea4e0cedfda565374508",
+    "flight_link": "b73b236bdb1430b4b6c9409da5a85f4764de07f398a6217cabc1a7b99fdd8212"
+  },
+  "scheduling_clock": "host monotonic; 2 ms target communication polling interval",
+  "mode": "manual_offboard",
+  "algorithm_dir": "/home/hhkqwq/SRM_UAV/PnP",
+  "simulation_overrides": {
+    "R_BC": [
+      [
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        -1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "T_BC_M": [
+      0.14,
+      0.0,
+      0.04
+    ]
+  },
+  "camera_mount": {
+    "source": "original config.py extrinsics; verified against actual Gazebo model",
+    "position_in_model_m": [
+      0.14,
+      0.0,
+      0.19999999999999998
+    ],
+    "sensor_rotation_in_model": [
+      [
+        -6.123233995736766e-17,
+        1.2246467991473532e-16,
+        -1.0
+      ],
+      [
+        -7.498798913309288e-33,
+        -1.0,
+        -1.2246467991473532e-16
+      ],
+      [
+        -1.0,
+        0.0,
+        6.123233995736766e-17
+      ]
+    ]
+  },
+  "detector_config": {
+    "LIGHT_EXTRACT_MODE": "GRAY",
+    "TARGET_COLOR": "ANY",
+    "LIGHT_L_MIN": 25,
+    "RED_THRESHOLD": [
+      10,
+      100,
+      20,
+      127,
+      -30,
+      127
+    ],
+    "BLUE_THRESHOLD": [
+      36,
+      100,
+      -60,
+      80,
+      -128,
+      0
+    ]
+  },
+  "processing_resolution": [
+    320,
+    240
+  ],
+  "ground_truth_policy": "aligned error statistics only; never an attitude, position or control input",
+  "options": {
+    "algorithm_dir": "/home/hhkqwq/SRM_UAV/PnP",
+    "px4_dir": "/home/hhkqwq/PX4-Autopilot",
+    "world": "pnp_pillar",
+    "model": "x500_mono_cam_down_0",
+    "image_topic": "/pnp/image_raw",
+    "camera_info_topic": "/pnp/camera_info",
+    "log_dir": "/home/hhkqwq/SRM_UAV/sim/logs",
+    "opencv_threads": 2,
+    "mavlink_port": 14540,
+    "no_mavlink": false,
+    "enable_control": true
+  },
+  "control_policy": "Shared PnP VisualServo; Position zero-velocity priming, pilot selects Offboard; fresh MEASURED/PREDICTED may navigate; no mission upload or automatic Offboard request",
+  "log_schema": "Compact shared PnP control fields plus 5 aligned truth fields; no aliases",
+  "csv_fields": [
+    "frame_id",
+    "capture_time_us",
+    "control_time_us",
+    "control_capture_time_us",
+    "link_generation",
+    "pose_valid",
+    "pose_reason",
+    "reprojection_px",
+    "relative_valid",
+    "relative_reason",
+    "p_local_raw_x_m",
+    "p_local_raw_y_m",
+    "p_local_raw_z_m",
+    "track",
+    "control_track",
+    "nav",
+    "flight",
+    "armed",
+    "offboard",
+    "vision_enabled",
+    "attitude_status",
+    "attitude_before_dt_ms",
+    "attitude_after_dt_ms",
+    "velocity_age_ms",
+    "observation_age_ms",
+    "control_p_local_x_m",
+    "control_p_local_y_m",
+    "control_p_local_z_m",
+    "command_vn_mps",
+    "command_ve_mps",
+    "command_vd_mps",
+    "setpoint_submitted",
+    "tx_status",
+    "tx_image_age_ms",
+    "true_p_local_x_m",
+    "true_p_local_y_m",
+    "true_p_local_z_m",
+    "truth_dt_us",
+    "truth_source"
+  ],
+  "sync_diagnostics": {
+    "path": "/home/hhkqwq/SRM_UAV/sim/logs/pnp_sim_20261121_060838_880890_sync.csv",
+    "source": {
+      "algorithm_dir": "/home/hhkqwq/SRM_UAV/PnP",
+      "flight_link_sha256": "b73b236bdb1430b4b6c9409da5a85f4764de07f398a6217cabc1a7b99fdd8212",
+      "config_sha256": "7ad9b68ef4805d1ee8ac6ab5fe949d55548515398c5b0ba1b1abbdfdbcb095e8",
+      "main_sha256": "029ef63c08e7282491b2a0d4802a1214940a5169e90dea4e0cedfda565374508",
+      "tracker_sha256": "4e5cdcb03c04b9c0d55fb840785e8967edefd17414d3ed2cf450a43d0f0c2c6e",
+      "servo_sha256": "3f799c0e2bf6fd303a543c5a5c5d00f80adb32f06b76d9f6e9d3ed54c166817a",
+      "detector_sha256": "29cbb066b00b024bfdfafb6be4afeefaae96b5d38a88a04eee7d20d35eaff2ad",
+      "pose_solver_sha256": "fcfaefdadb022697eec181c40721b00bf14cff9a713a938bd76d226b6d87bf26",
+      "link_service_sha256": "92089d02be377d6f8b5524296a3f293858b926005112019ee303fff93afe52ea"
+    },
+    "policy": "Shared PnP synchronization decisions; compact 1 Hz summaries plus anomaly events",
+    "time_observation": "Request stamped at write and fresh receive processing time; not hardware timestamps"
+  },
+  "camera_calibration": {
+    "native_size": [
+      320,
+      240
+    ],
+    "native_k": [
+      302.11830698360654,
+      0.0,
+      163.3557244238438,
+      0.0,
+      302.03599395976175,
+      117.66487385855488,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "native_d": [
+      0.09984656079919686,
+      -0.23986524630434,
+      -0.0007887596884331264,
+      0.00012132382106465136,
+      0.16915439320944928
+    ],
+    "processing_size": [
+      320,
+      240
+    ],
+    "processing_intrinsics": [
+      302.11830698360654,
+      302.03599395976175,
+      163.3557244238438,
+      117.66487385855488
+    ],
+    "resize": "INTER_AREA; pixel-center mapping"
+  }
+}

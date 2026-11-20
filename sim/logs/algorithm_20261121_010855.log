@@ -1,0 +1,42 @@
+[INFO] [1795194543.509077844] [pnp_sim_algorithm]: TIMESYNC diagnostics=/home/hhkqwq/SRM_UAV/sim/logs/pnp_sim_20261121_010903_492769_sync.csv
+[INFO] [1795194543.509745297] [pnp_sim_algorithm]: Mode=manual_offboard; CSV=/home/hhkqwq/SRM_UAV/sim/logs/pnp_sim_20261121_010903_492769.csv
+[INFO] [1795194543.509922686] [pnp_sim_algorithm]: Waiting for image, CameraInfo and Gazebo simulation clock
+[INFO] [1795194543.510087571] [pnp_sim_algorithm]: Offboard待命：在Position中人工起飞、靠近目标并减速；PRIMING至少约1.2秒后手动切Offboard。
+[WARN] [1795194543.520006011] [pnp_sim_algorithm]: No new image; check camera bridge and simulation playback
+[INFO] [1795194545.483664701] [pnp_sim_algorithm]: CameraInfo native=320x240; algorithm=(320, 240); scaled fx/fy/cx/cy=(302.11830698360654, 302.03599395976175, 163.3557244238438, 117.66487385855488); d=[0.09984656079919686, -0.23986524630434, -0.0007887596884331264, 0.00012132382106465136, 0.16915439320944928]; original detector configuration
+[INFO] [1795194545.497834748] [pnp_sim_algorithm]: track=IDLE nav=HEARTBEAT_STALE flight=HEARTBEAT_STALE offboard=False vision_enabled=False
+[INFO] [1795194547.513864172] [pnp_sim_algorithm]: track=IDLE nav=TIME_UNSYNCED flight=ATTITUDE_STALE offboard=False vision_enabled=False
+[INFO] [1795194549.527710091] [pnp_sim_algorithm]: track=IDLE nav=ESTIMATOR_UNREADY flight=ESTIMATOR_UNREADY offboard=False vision_enabled=False
+[INFO] [1795194551.584889853] [pnp_sim_algorithm]: track=IDLE nav=ESTIMATOR_UNREADY flight=ESTIMATOR_UNREADY offboard=False vision_enabled=False
+[INFO] [1795194553.615030803] [pnp_sim_algorithm]: track=IDLE nav=ESTIMATOR_UNREADY flight=ESTIMATOR_UNREADY offboard=False vision_enabled=False
+[INFO] [1795194555.643045905] [pnp_sim_algorithm]: track=IDLE nav=ESTIMATOR_UNREADY flight=ESTIMATOR_UNREADY offboard=False vision_enabled=False
+[INFO] [1795194557.652568970] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194559.655029930] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194561.682661030] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194563.682661208] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194565.684812997] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194567.723330895] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194569.742599987] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194571.743167056] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194573.745227806] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194575.754990058] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194577.783327266] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194579.814082773] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194581.852564497] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194583.854920711] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194585.882520139] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194587.883119064] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194589.922691345] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194591.945061042] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194593.952180644] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194595.984947426] [pnp_sim_algorithm]: track=IDLE nav=WAIT_OFFBOARD flight=OK offboard=False vision_enabled=False
+[INFO] [1795194598.022626370] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
+[INFO] [1795194600.052674809] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
+[INFO] [1795194602.095811483] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
+[INFO] [1795194604.115848498] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
+[INFO] [1795194606.123055760] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
+[INFO] [1795194608.132854717] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
+[INFO] [1795194610.162693381] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
+[INFO] [1795194612.163938880] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
+[INFO] [1795194614.173818974] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
+[INFO] [1795194616.193011109] [pnp_sim_algorithm]: track=IDLE nav=PRIMING flight=OK offboard=False vision_enabled=False
