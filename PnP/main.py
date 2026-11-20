@@ -1,13 +1,15 @@
 """OpenMV室内视觉任务：人工切Offboard后开始识别与导航。"""
 import math
 import os
+import json
 import config as C
 from pose_solver import (PlanarPoseSolver, finite, rotation_valid, local_to_camera,
-                         relative_measurement, quaternion_rotation, mv,
+                         relative_measurement, quaternion_rotation,
                          camera_down_normal)
 from target_tracker import TargetTracker
 from flight_link import Clock, FlightLink
 from visual_servo import VisualServo
+from comm_log import CommCSVLogger
 
 # 只记录诊断数据，不改变视觉、跟踪或导航参数。
 POSE_LOG_ENABLE = True
@@ -15,22 +17,13 @@ POSE_LOG_INTERVAL_MS = 200
 POSE_LOG_FLUSH_MS = 1000
 
 POSE_LOG_FIELDS = (
-    "frame_id", "capture_time_us", "log_time_us", "capture_ms",
-    "frame_pre_log_ms", "fps", "solve_ms", "attitude_valid",
-    "q_w", "q_x", "q_y", "q_z", "roll_deg", "pitch_deg", "yaw_deg",
-    "pose_valid", "pose_reason", "reprojection_px",
-    "p_C_x_m", "p_C_y_m", "p_C_z_m",
-) + tuple("r_CT_%d%d" % (i, j) for i in range(3) for j in range(3)) + (
-    "relative_valid", "relative_reason", "normal_tilt_deg",
+    "frame_id", "capture_time_us", "control_time_us", "control_capture_time_us", "link_generation",
+    "pose_valid", "pose_reason", "reprojection_px", "relative_valid", "relative_reason",
     "p_local_raw_x_m", "p_local_raw_y_m", "p_local_raw_z_m",
-    "p_local_x_m", "p_local_y_m", "p_local_z_m",
-    "velocity_N_mps", "velocity_E_mps", "velocity_D_mps",
-    "track", "nav", "flight", "track_age_ms", "observation_age_ms",
-    "configured", "config_errors", "color",
-) + tuple("%s%d_px" % (axis, i) for i in range(1, 5) for axis in ("u", "v")) + (
-    "pnp_mode", "vision_enabled", "control_time_us",
-    "control_track", "armed", "offboard", "main_mode", "sub_mode",
-    "setpoint_submitted", "command_vn_mps", "command_ve_mps", "command_vd_mps",
+    "track", "control_track", "nav", "flight", "armed", "offboard", "vision_enabled",
+    "attitude_status", "attitude_before_dt_ms", "attitude_after_dt_ms", "velocity_age_ms",
+    "observation_age_ms", "control_p_local_x_m", "control_p_local_y_m", "control_p_local_z_m",
+    "command_vn_mps", "command_ve_mps", "command_vd_mps", "setpoint_submitted", "tx_status", "tx_image_age_ms",
 )
 
 
@@ -62,6 +55,14 @@ def _values(value, count):
     return (None,) * count if value is None else tuple(value)
 
 
+def log_state_key(track,nav,flight,alignment):
+    """Normal interpolation/extrapolation changes stay in 5 Hz samples."""
+    attitude = alignment.get('attitude_status')
+    if attitude in ('EXACT','INTERPOLATED','EXTRAPOLATED'):
+        attitude = 'OK'
+    return (track,nav,flight.get('reason'),flight.get('armed'),flight.get('offboard'),attitude)
+
+
 class PoseCSVLogger:
     """自动编号CSV；默认5Hz采样、每秒刷新，写入失败只停止记录。"""
     def __init__(self, directory="/", enabled=POSE_LOG_ENABLE, start_us=0):
@@ -70,16 +71,22 @@ class PoseCSVLogger:
         self.last_sample_us = None
         self.last_flush_us = start_us
         self.last_error = None
+        self.last_state = None
         if not enabled:
             return
         try:
             for index in range(1, 10000):
                 path = directory.rstrip("/") + "/pnp_pose_%04d.csv" % index
-                try:
-                    os.stat(path)
-                except OSError as error:
-                    if not error.args or error.args[0] != 2:
-                        raise
+                occupied = False
+                for candidate in (path,path[:-4]+'.json',path[:-4]+'_sync.csv'):
+                    try:
+                        os.stat(candidate)
+                        occupied = True
+                        break
+                    except OSError as error:
+                        if not error.args or error.args[0] != 2:
+                            raise
+                if not occupied:
                     self.path = path
                     self.file = open(path, "w")
                     break
@@ -87,6 +94,8 @@ class PoseCSVLogger:
                 raise OSError("LOG_INDEX_EXHAUSTED")
             self._write(",".join(POSE_LOG_FIELDS) + "\n")
             self.file.flush()
+            with open(self.path[:-4]+'.json','w') as metadata:
+                metadata.write(json.dumps(run_metadata()))
             print("LOG=%s" % self.path)
         except Exception as error:
             self.fail(error)
@@ -96,13 +105,14 @@ class PoseCSVLogger:
         if written is not None and written != len(line):
             raise OSError("CSV_SHORT_WRITE")
 
-    def due(self, now_us):
+    def due(self, now_us, state=None):
         return (self.file is not None and
-                (self.last_sample_us is None or
-                 now_us-self.last_sample_us >= POSE_LOG_INTERVAL_MS*1000))
+                (state is not None and state != self.last_state or
+                 self.last_sample_us is None or
+                 not 0 <= now_us-self.last_sample_us < POSE_LOG_INTERVAL_MS*1000))
 
-    def write(self, row, now_us):
-        if not self.due(now_us):
+    def write(self, row, now_us, state=None):
+        if not self.due(now_us,state):
             return False
         try:
             if len(row) != len(POSE_LOG_FIELDS):
@@ -112,6 +122,7 @@ class PoseCSVLogger:
                 self.file.flush()
                 self.last_flush_us = now_us
             self.last_sample_us = now_us
+            self.last_state = state
             return True
         except Exception as error:
             self.fail(error)
@@ -142,52 +153,72 @@ def pose_log_row(frame_id, stamp, now, capture_us, pre_log_us, fps,
                  nav_state, points, color,
                  vision_enabled=True, control_time_us=None, control_track=None,
                  output=None, setpoint_submitted=False):
-    pose_valid = bool(pose and pose.get("valid"))
-    p = pose.get("position") if pose_valid else None
-    rotation = pose.get("rotation") if pose_valid else None
-    is_configured = configured()
-    normal_tilt = None
-    if not pose_valid:
-        reason = "PNP_INVALID" if pose is not None else "NO_POSE"
-    elif not is_configured:
-        reason = "CONFIG_UNREADY"
-    elif q is None:
-        reason = "ATTITUDE_UNAVAILABLE"
-    else:
-        r_nb = quaternion_rotation(q)
-        normal = mv(r_nb, mv(C.R_BC, tuple(row[2] for row in rotation)))
-        normal_tilt = math.acos(max(-1., min(1., normal[2]))) * 180./math.pi
-        if relative is not None:
-            reason = "OK"
-        elif normal[2] < math.cos(C.MAX_NORMAL_TILT_DEG*math.pi/180.):
-            reason = "PLANE_NORMAL_TILT"
-        else:
-            reason = "RELATIVE_DEPTH_REJECTED"
-    pose_reason = pose.get("reason", "UNKNOWN") if pose is not None else (
-        "MODEL_MISSING" if C.TARGET_POINTS_T_M is None else "NO_PAIR")
-    measurement_ms = track.get("measurement_ms")
-    return (
-        frame_id, stamp, now, None if capture_us is None else capture_us*.001, pre_log_us*.001, fps,
-        None if solve_us is None else solve_us*.001, q is not None,
-    ) + _values(q, 4) + _values(attitude_rpy_deg(q), 3) + (
-        pose_valid, pose_reason,
-        pose.get("reprojection_px") if pose is not None else None,
-    ) + _values(p, 3) + (
-        (None,) * 9 if rotation is None else tuple(v for row in rotation for v in row)
-    ) + (
-        relative is not None, reason, normal_tilt,
-    ) + _values(relative, 3) + _values(track.get("position"), 3) + _values(velocity, 3) + (
-        track["state"], nav_state, flight["reason"], track.get("age_ms"),
-        None if measurement_ms is None else now//1000-measurement_ms,
-        is_configured, "|".join(C.readiness_errors()), color,
-    ) + ((None,) * 8 if points is None else tuple(v for point in points for v in point)) + (
-        pose.get("mode") if pose else None,
-        vision_enabled, control_time_us,
-        control_track.get("state") if control_track else None,
-        flight.get("armed"), flight.get("offboard"),
-        flight.get("main_mode"), flight.get("sub_mode"), setpoint_submitted,
-    ) + _values(output.get("velocity") if output else None, 3)
+    """Compact frame diagnostics plus explicitly identified control input.
 
+    Raw position/truth refer to ``stamp``. The compensated control position
+    refers to ``control_time_us`` and its own ``control_capture_time_us``.
+    """
+    valid = bool(pose and pose.get('valid'))
+    if not valid: reason = 'PNP_INVALID' if pose else 'NO_POSE'
+    elif not configured(): reason = 'CONFIG_UNREADY'
+    elif q is None: reason = 'ATTITUDE_UNAVAILABLE'
+    elif relative is None: reason = 'RELATIVE_REJECTED'
+    else: reason = 'OK'
+    control = control_track or {}
+    alignment = track.get('_alignment',{})
+    measurement = control.get('measurement_ms')
+    age = None if measurement is None or control_time_us is None else control_time_us//1000-measurement
+    source = control.get('_capture_us')
+    tx_age = flight.get('tx_age_us') if flight.get('tx_control_us')==control_time_us else None
+    return (frame_id,stamp,control_time_us,source,track.get('_link_generation'),
+            valid,pose.get('reason','UNKNOWN') if pose else 'NO_PAIR',
+            pose.get('reprojection_px') if pose else None,
+            relative is not None,reason) + _values(relative,3) + (
+            track.get('state'),control.get('state'),nav_state,flight.get('reason'),
+            flight.get('armed'),flight.get('offboard'),vision_enabled,
+            alignment.get('attitude_status'),alignment.get('attitude_before_dt_ms'),
+            alignment.get('attitude_after_dt_ms'),alignment.get('velocity_age_ms'),age,
+            ) + _values(control.get('position'),3) + _values(output.get('velocity') if output else None,3) + (
+            setpoint_submitted,flight.get('tx_status'),None if tx_age is None else tx_age*.001)
+
+
+def run_metadata():
+    """Static facts are written once, never repeated in each frame/event."""
+    controls = ('TARGET_HEIGHT_M','ARRIVAL_XY_M','ARRIVAL_Z_M','ARRIVAL_DWELL_MS',
+                'KP_XY','KP_Z','MAX_SPEED_XY','MAX_SPEED_Z','MAX_ACCEL_XY','MAX_ACCEL_Z',
+                'CONTROL_INTERVAL_MS','LOST_BRAKE_MS')
+    metadata = {'schema_version':2,'implementation':'shared_pnp_communication_v2',
+            'clock':'local unfolded microseconds; remote=local+offset_us',
+            'log_interval_ms':POSE_LOG_INTERVAL_MS,
+            'control_config':{key:getattr(C,key) for key in controls},
+            'timing_limits':{key:getattr(C,key) for key in (
+                'SYNC_INTERVAL_MS','SYNC_RECOVERY_INTERVAL_MS','SYNC_MAX_RTT_MS',
+                'SYNC_MAX_JITTER_US','SYNC_MIN_SAMPLES','SYNC_TIMEOUT_MS',
+                'SYNC_WINDOW_MS','SYNC_WINDOW_SIZE','SYNC_RESET_US',
+                'ATTITUDE_EXTRAPOLATE_MS','TELEMETRY_TIMEOUT_MS','MAX_TX_AGE_MS')},
+            'camera':{'intrinsics':C.INTRINSICS,'distortion':C.DIST_COEFFS,
+                      'R_BC':C.R_BC,'T_BC_M':C.T_BC_M,
+                      'capture_delay_us':C.CAMERA_CAPTURE_DELAY_US},
+            'transmit_note':'WRITTEN is a completed local write, not a PX4 execution acknowledgement'}
+    try:
+        import hashlib
+        import binascii
+        paths = {'config':getattr(C,'__file__','config.py'),
+                 'main':globals().get('__file__','main.py'),
+                 'flight_link':getattr(__import__(FlightLink.__module__),'__file__','flight_link.py')}
+        hashes = {}
+        for name,path in paths.items():
+            checksum = hashlib.sha256()
+            with open(path,'rb') as source:
+                while True:
+                    data = source.read(512)
+                    if not data: break
+                    checksum.update(data)
+            hashes[name] = binascii.hexlify(checksum.digest()).decode()
+        metadata['source_sha256'] = hashes
+    except (ImportError,OSError,AttributeError) as error:
+        metadata['source_hash_error'] = str(error)
+    return metadata
 
 def terminal_report(fps, position, q, solve_mean_ms, solve_peak_ms):
     p = "None" if position is None else "(%.3f,%.3f,%.3f)" % tuple(position)
@@ -225,8 +256,15 @@ def process_image(img, stamp, solver, tracker, detector, clock, link,
         pair,color = detector.select_best_pair(rp,bp)
     if link:
         link.poll()
-    q = link.attitude_at(stamp) if link else None
-    velocity = link.velocity_at(stamp) if link else None
+    if link:
+        q,velocity,alignment,link_generation = link.observation_at(stamp)
+    else:
+        q,velocity,alignment,link_generation = None,None,{'attitude_status':'NO_LINK'},None
+    previous_generation = getattr(tracker,'flight_generation',link_generation)
+    if previous_generation != link_generation:
+        tracker.__init__()
+        previous,previous_color = None,None
+    tracker.flight_generation = link_generation
     detection,pose,relative,points,spent = None,None,None,None,None
     if pair is not None:
         cx,cy,_,_,w,h = detector.get_pair_geometry(pair)
@@ -244,27 +282,41 @@ def process_image(img, stamp, solver, tracker, detector, clock, link,
                 if configured() and q is not None:
                     relative = relative_measurement(pose,q,C.R_BC,C.T_BC_M)
     track = tracker.update(detection,stamp//1000,relative,velocity)
+    track['_alignment'],track['_link_generation'] = alignment,link_generation
     if not vision_active:
         track["state"] = "IDLE"
     return ({"detection":detection,"pose":pose,"relative":relative,"points":points,
              "track":track,"color":color,"solve_us":spent,"stamp_us":stamp,
-             "q":q,"velocity":velocity,"vision_enabled":vision_active},previous,previous_color)
+             "q":q,"velocity":velocity,"vision_enabled":vision_active,
+             "alignment":alignment,"link_generation":link_generation},previous,previous_color)
 
 
 def update_control(track, flight, stamp, now, servo, link):
     """共享延迟补偿、控制更新和发送/释放逻辑，不增加独立接管状态。"""
     control_track = dict(track)
-    delay = max(0.,(now-stamp)*1e-6)
-    if track.get("position") is not None:
-        current_v = flight.get("velocity")
-        if current_v is not None:
-            control_track["position"] = tuple(track["position"][i]-current_v[i]*delay for i in range(3))
-        if track.get("age_ms") is None or track["age_ms"]+delay*1000 > C.MAX_PREDICTION_MS:
+    control_track['_capture_us'] = stamp
+    invalid_epoch = link is not None and track.get('_link_generation') != flight.get('generation')
+    if stamp > now or now-stamp > C.MAX_PREDICTION_MS*1000 or invalid_epoch:
+        control_track.update(position=None,state='LOST')
+    if control_track.get('position') is not None:
+        displacement = link.displacement(stamp,now) if link else None
+        if displacement is None:
+            control_track.update(position=None,state='LOST')
+        else:
+            control_track['position'] = tuple(track['position'][i]-displacement[i] for i in range(3))
+        measurement = track.get('measurement_ms')
+        age = None if measurement is None else now//1000-measurement
+        control_track['age_ms'] = age
+        if age is None or not 0 <= age <= C.MAX_PREDICTION_MS:
             control_track["position"],control_track["state"] = None,"LOST"
     previous_nav = servo.state
     output = servo.update(control_track,flight,now//1000,configured())
     submitted = False
     if link:
+        has_position = control_track.get('position') is not None
+        measurement = control_track.get('measurement_ms')
+        link.set_control_source(stamp if has_position else None,
+                                measurement*1000 if has_position and measurement is not None else None)
         if output is None or output.get("velocity") is None:
             link.cancel_setpoint()
             if (servo.state in ("LOST_RELEASE","LOOP_STALE") and servo.state != previous_nav
@@ -294,6 +346,9 @@ def run():
     nav_state = "DISABLED"
     last_report,last_control = clock.now_us(),-10000000
     logger = PoseCSVLogger(start_us=last_report)
+    comm_logger = (CommCSVLogger(link,logger.path[:-4]+'_sync.csv',clock=clock)
+                   if link and logger.path else None)
+    comm_error = None
     frames,solves,solve_sum,solve_peak,frame_id = 0,0,0,0,0
     previous,previous_color = None,None
     generation = link.generation if link else 0
@@ -340,6 +395,7 @@ def run():
                 control_time = now
             if link:
                 link.poll()
+                flight = link.state(clock.now_us())
             if C.DEBUG_MODE:
                 center = None
                 cross_color = (255,160,0)  # 中心关联或预测，不代表新鲜三维测量
@@ -354,7 +410,8 @@ def run():
                     img.draw_cross(int(round(center[0])),int(round(center[1])),size=8,color=cross_color,thickness=2)
             pre_log_end = clock.now_us()
             frame_id += 1
-            if logger.due(pre_log_end):
+            log_state = log_state_key(track['state'],nav_state,flight,track.get('_alignment',{}))
+            if logger.due(pre_log_end,log_state):
                 try:
                     seconds = max(1e-6, (pre_log_end-last_report)*1e-6)
                     row = pose_log_row(
@@ -363,9 +420,14 @@ def run():
                         relative, track, velocity, flight, nav_state, points, color,
                         vision_active, control_time, control_track,
                         output, setpoint_submitted)
-                    logger.write(row, pre_log_end)
+                    logger.write(row, pre_log_end,log_state)
                 except Exception as error:
                     logger.fail(error)
+            if comm_logger:
+                comm_logger.record()
+                if comm_logger.error and comm_logger.error != comm_error:
+                    comm_error = comm_logger.error
+                    print('COMM_LOG_ERROR=%s' % comm_error)
             end = clock.now_us()
             frames += 1
             if end-last_report >= C.DEBUG_PRINT_INTERVAL_MS*1000:
@@ -383,6 +445,8 @@ def run():
             if link:
                 link.cancel_setpoint()
         finally:
+            if comm_logger:
+                comm_logger.close()
             logger.close()
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@
 将以下文件放在 OpenMV 同一目录：
 
 - `main.py`、`config.py`、`armor_detect.py`
-- `pose_solver.py`、`target_tracker.py`、`visual_servo.py`、`flight_link.py`
+- `pose_solver.py`、`target_tracker.py`、`visual_servo.py`、`flight_link.py`、`comm_log.py`
 
 当前 `NAV_ENABLE=True`，启用人工 Offboard 导航；`NAV_ENABLE=False` 时持续识别和记录，只观察不发送控制参考。板端和仿真均不使用Mission，不上传任务或GPS保持点。
 
@@ -58,25 +58,44 @@
 
 在QGC的Flight Modes中自行选择模式通道与Offboard档位，保留可切回Position的操作。配置并验证 `COM_OF_LOSS_T`、`COM_OBL_RC_ACT`；Position请求能否成功取决于当时定位，不能承诺状态估计失效后仍能定点保持。程序不写飞控参数。
 
+## 时间同步与延迟补偿
+
+板端与仿真使用同一份 `FlightLink`：TIMESYNC在首字节即将write时填写时间戳，零字节发送失败后重试会重新取时，部分写入开始后保持原报文不变。只有实际开始发送才建立待回复事务；接收每份消息时重新取时，发送队列等待不再进入时钟偏移公式。同步报文也有排队期限，过期后丢弃并重试。
+
+启动和恢复阶段每200ms采样，稳定后每1秒采样；至少3个近期一致样本后建立同步。低RTT样本与中位数抑制偶发延迟，连续3个一致变化允许重新收敛；单个大离群点不清空历史。确认的大幅时钟变化、PX4重启或本地时钟回退会使旧观测失效。保留30ms RTT上限、5秒同步有效期、200ms遥测时效与30ms姿态外推上限；具体数值统一由 `config.py` 管理。
+
+图像按采集时间查询姿态插值/受限外推和速度插值。控制前重新取时，以PX4速度历史的梯形积分补偿采集至控制的位移；无法覆盖该区间时不继续使用旧目标位置。补偿只作用于控制副本，不写回采集时刻的跟踪状态。短时姿态缺失使用原跟踪器的有限预测，不因单帧缺失额外清空轨迹；同步或整体遥测失效仍执行原健康门控。
+
+板端在取图前提供最长约30ms的有界同步应答服务，并在图像处理、求解和控制附近穿插非阻塞轮询。仿真使用约2ms调度目标的独立通信线程，通过短锁访问共用链路；图像计算及日志写盘不持有通信锁。服务间隔由日志中的 `poll_gap_us/poll_wall_gap_us` 观察。
+
+这些时间是软件write和消息处理时刻，不是硬件线路时间戳。真实曝光时刻仍由snapshot前后中点近似，`CAMERA_CAPTURE_DELAY_US`需要实机测量；同步估计不能消除全部单向传输延迟。
+
 ## 日志
 
-运行时在OpenMV当前根文件系统创建 `/pnp_pose_0001.csv` 等递增编号文件，启动打印 `LOG=实际路径`。默认约每200ms记录一次，每秒刷新缓冲，正常退出时关闭文件。停桨不关闭日志；断电或强制重启不能保证最后未刷盘数据完整。`LOG_ERROR=...; recording stopped` 表示记录已停止。只保存数值，不保存图像或视频。
+运行时自动编号创建 `/pnp_pose_NNNN.csv`、同名 `.json` 配置和 `/pnp_pose_NNNN_sync.csv` 通信记录，启动会打印实际路径。控制日志默认约每200ms记录一次，并补记状态变化；通信日志正常每1秒摘要，只对异常和状态转换单独记事件。每秒刷新缓冲，正常退出关闭文件；写入错误只停止相应日志并提示。历史文件不覆盖，不保存图像或视频。
+
+控制CSV由原70列精简为34列，删除完整四元数、重复欧拉角、旋转矩阵、像素角点、滤波位置副本、帧率和求解耗时等常驻列。保留定位有效性、原始相对位置、实际控制输入和必要时序；精确列名以 `main.POSE_LOG_FIELDS` 为准。
 
 | 字段 | 含义 |
 | --- | --- |
-| `capture_time_us` / `log_time_us` / `control_time_us` | 图像采集近似时刻、记录时刻、最近控制更新时刻；均为本次程序的本地单调时钟 |
-| `vision_enabled` | 该帧是否运行识别与PnP |
-| `track` | 图像跟踪状态，如 `MEASURED/PREDICTED/ACQUIRING/LOST`，待命为 `IDLE` |
-| `control_track` | 最近控制更新经过延迟/超时检查后实际使用的跟踪状态 |
-| `nav` | 现有 `VisualServo` 状态，如 `ALIGN/HOLD/ACQUIRING/BRAKING` |
-| `flight` | 飞控遥测就绪情况或拒绝原因 |
-| `armed` / `offboard` / `main_mode` / `sub_mode` | 心跳中的实际模式与解锁状态 |
-| `setpoint_submitted` | 最近参考是否进入发送缓冲，不等于飞控执行确认 |
-| `command_vn_mps` / `command_ve_mps` / `command_vd_mps` | 最近控制更新产生的北/东/下速度参考 |
-| `p_local_x_m` / `p_local_y_m` / `p_local_z_m` | 图像跟踪器估计的目标相对位置，NED，单位m |
-| `pose_valid` / `relative_valid` / `observation_age_ms` | PnP、坐标变换有效性及真实观测年龄 |
+| `frame_id/capture_time_us` | 当前图像编号与采集时间 |
+| `control_time_us/control_capture_time_us` | 最近控制更新的时间及其实际使用的源图像时间；不可默认与当前图像相同 |
+| `link_generation` | 本次观测所属链路代数，重置前后的观测不能混用 |
+| `track/control_track/nav/flight` | 图像跟踪状态、控制实际采用状态、VisualServo行为和飞控健康原因 |
+| `armed/offboard/vision_enabled` | 解锁、实际Offboard和识别启用情况 |
+| `pose_valid/pose_reason/relative_valid/relative_reason/reprojection_px` | 区分视觉求解失败、姿态不可用和坐标变换拒绝 |
+| `attitude_status/attitude_before_dt_ms/attitude_after_dt_ms` | 姿态匹配结果及前后样本相对采集时刻的时间差 |
+| `velocity_age_ms/observation_age_ms` | 采集时速度匹配年龄与最近真实目标观测的年龄 |
+| `p_local_raw_x_m/y_m/z_m` | 当前图像采集时的原始NED相对测量 |
+| `control_p_local_x_m/y_m/z_m` | 经预测、延迟与有效性检查后实际用于控制的NED位置 |
+| `command_vn_mps/ve_mps/vd_mps/setpoint_submitted` | 速度参考和本机缓冲提交结果 |
+| `tx_status/tx_image_age_ms` | 发送状态及已write参考的源图像年龄；write不等于PX4采用或执行ACK |
 
-例如 `track=MEASURED, control_track=MEASURED, nav=HOLD, offboard=1` 表示控制器使用真实观测并判断已经到位；`MEASURED`本身不等于到位，需要结合相对位置判断。5Hz采样可能遗漏短暂状态变化，时间戳不直接等同北京时间或PX4日志时间。
+通信CSV只有23列，定义在 `comm_log.COMM_LOG_FIELDS`。正常摘要保留偏移、最近RTT/创新量、同步年龄、排队等待、心跳和遥测年龄、累计最大服务间隔、发送时刻与源图像年龄，以及CRC、倒序、回复不匹配、同步失效、发送丢弃和诊断丢事件计数。异常行只填写该事件相关字段，不附加整份状态快照、Mission上下文或每次成功交换的原始数据。
+
+`SYNC_REPLY_TIMEOUT`表示一笔请求未及时得到回复，`SYNC_TIMEOUT`表示超过5秒未接受有效偏移；两者分别统计。`poll_gap_us/poll_wall_gap_us`是启动以来仿真/本地时间与电脑单调时间下的最大服务间隔。暂停仿真时，电脑时间只用于通信调度和日志刷新，不推进物理预测。
+
+将板端通信CSV复制到电脑后，可交给仿真目录中的 `analyze_sync.py` 分析。新通信CSV和历史JSONL均可读取。摘要或异常采样的延迟分布不是全包延迟统计；缺少回复不能单独证明唯一故障原因。
 
 ## 仿真与验证范围
 
@@ -86,6 +105,6 @@
 bash /home/hhkqwq/SRM_UAV/sim/start_simulation.sh
 ```
 
-仿真直接调用本目录的模式门控、识别/PnP、跟踪、延迟补偿、控制发送和日志函数；CSV及状态话题使用PnP字段，只附加8个真值字段，不写旧别名。分析工具按同一字段计算误差和到位，参数取当次PnP配置。仅观察使用 `--observe`；原Mission、独立接管模块和仿真独立的姿态/帧率入口已移除。原有同步诊断和历史日志保留。详见 [sim/README.md](/home/hhkqwq/SRM_UAV/sim/README.md)。
+仿真直接调用本目录的模式门控、识别/PnP、跟踪、延迟补偿、控制发送和日志函数；CSV及状态话题使用PnP字段，只附加5个采集时对齐真值字段，不写旧别名。分析工具按同一字段计算误差和到位，参数取当次PnP配置。仅观察使用 `--observe`；原Mission、独立接管模块和仿真独立的姿态/帧率入口已移除。新通信日志使用精简CSV，历史CSV/JSONL仍可分析。详见 [sim/README.md](/home/hhkqwq/SRM_UAV/sim/README.md)。
 
-2026-11-19：当前字段和共享处理链通过24项离线验证及语法检查，覆盖板端主循环、模式门控、实测/预测导航、制动与释放、两端字段一致性及分析边界。旧日志只在分析读取时转换，未修改控制参数或新增接管状态机。临时测试文件在完成后清理，不进入项目。未连接真机、未运行Gazebo完整闭环；MTF-02融合、实际频率、串口负载和悬停效果仍需实测。
+2026-11-19：本次离线验证覆盖共享链路的时间同步、收发阻塞与重试、速度积分、模式门控、缺测预测、日志字段和历史分析兼容。临时验证脚本完成后清理，不作为项目运行依赖。本次没有连接真机或运行Gazebo完整闭环；MTF-02融合、实际串口频率与负载、曝光延迟和悬停效果仍需实测。

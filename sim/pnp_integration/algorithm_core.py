@@ -48,6 +48,7 @@ def load_file(name, path):
 def load_original(directory, enable_control=None):
     directory = Path(directory).resolve()
     config = load_file('_pnp_sim_config', directory / 'config.py')
+    comm_log = load_file('_pnp_sim_comm_log', directory / 'comm_log.py')
     # Only platform/camera adaptations. Detector settings remain exactly as
     # loaded from the user's config.py, including GRAY/ANY and both thresholds.
     if enable_control is not None:
@@ -63,10 +64,11 @@ def load_original(directory, enable_control=None):
             servo = load_file('_pnp_sim_visual_servo', directory / 'visual_servo.py')
             link = load_file('_pnp_sim_flight_link', directory / 'flight_link.py')
             detector = load_file('_pnp_sim_armor_detect', directory / 'armor_detect.py')
-            with module_aliases({'target_tracker': tracker, 'visual_servo': servo, 'flight_link': link}):
+            with module_aliases({'target_tracker': tracker, 'visual_servo': servo, 'flight_link': link,
+                                 'comm_log': comm_log}):
                 runtime = load_file('_pnp_sim_main', directory / 'main.py')
     return SimpleNamespace(config=config, pose=pose, tracker=tracker,
-                           servo=servo, link=link, detector=detector, runtime=runtime)
+                           servo=servo, link=link, detector=detector, runtime=runtime,comm_log=comm_log)
 
 
 class Algorithm:

@@ -9,11 +9,21 @@ from analyze_log import counts,flag,number,read_rows,run_settings,select_csv,sta
 
 
 def navigating(row):
-    return (flag(row,'armed') and flag(row,'offboard') and flag(row,'configured')
+    return (flag(row,'armed') and flag(row,'offboard')
+            and ('configured' not in row or flag(row,'configured'))
             and row.get('flight')=='OK' and flag(row,'setpoint_submitted')
             and row.get('control_track') in ('MEASURED','PREDICTED')
             and row.get('nav') in ('CENTERING','ALIGN','PREDICT','HOLD','TARGET_CHANGED'))
 
+
+
+def source_matches(row):
+    """Capture-time truth only belongs to a command based on this source image."""
+    if 'control_capture_time_us' not in row:
+        return True  # Historical schema cannot expose this association.
+    capture = number(row,'capture_time_us')
+    source = number(row,'control_capture_time_us')
+    return capture is not None and source is not None and capture==source
 
 def offboard_runs(rows):
     runs=[]
@@ -65,6 +75,8 @@ def summarize(path,final_seconds=10.):
                   final_sample_count=len(final),max_sample_gap_s=max(gaps) if gaps else None,
                   navigation_rows=sum(navigating(r) for r in final),
                   navigation_rate=sum(navigating(r) for r in final)/len(final),
+                  control_source_match_rate=(sum(source_matches(r) for r in final)/len(final)
+                      if quality['control_source_recorded'] else None),
                   final_track_states=counts(final,'track'),final_nav_states=counts(final,'nav'),
                   final_flight_reasons=counts(final,'flight'),
                   final_horizontal_error_m=stats([h for h,z in errors]),
@@ -78,7 +90,7 @@ def summarize(path,final_seconds=10.):
     previous=None
     for row,(horizontal,vertical) in zip(final,errors):
         stamp=number(row,'capture_time_us')
-        arrived=(navigating(row) and row.get('control_track')=='MEASURED' and row.get('nav')=='HOLD'
+        arrived=(navigating(row) and source_matches(row) and row.get('control_track')=='MEASURED' and row.get('nav')=='HOLD'
                  and horizontal is not None and vertical is not None
                  and horizontal<=parameters['ARRIVAL_XY_M'] and abs(vertical)<=parameters['ARRIVAL_Z_M'])
         if not arrived:
@@ -93,9 +105,12 @@ def summarize(path,final_seconds=10.):
     if not quality['control_input_recorded']:
         report['reason']='CONTROL_INPUT_NOT_RECORDED'
         report['passed']=False
-    report['criterion']='Last recorded Offboard run: consecutive sampled HOLD, MEASURED control input and truth within PnP ARRIVAL_XY_M/ARRIVAL_Z_M for ARRIVAL_DWELL_MS; gaps <=2 logging intervals.'
+    report['criterion']='Last recorded Offboard run: consecutive sampled HOLD and MEASURED control input; source-image-time truth within PnP ARRIVAL_XY_M/ARRIVAL_Z_M for ARRIVAL_DWELL_MS; new schema requires control source image to match truth image; gaps <=2 logging intervals.'
     report['notes']=['PREDICTED is valid navigation input; arrival confirmation follows PnP and needs MEASURED.',
+                     'Truth is evaluated at source-image capture time, not at the later control/send time.',
                      'This evaluates recorded samples at the end of the selected run, not flight-controller execution ACK or unobserved motion.']
+    if not quality['control_source_recorded']:
+        report['notes'].append('历史格式没有控制源图像时间，不能确认每行控制状态与真值图像的精确关联。')
     if parameters['source']=='current_PnP_config_fallback':
         report['notes'].append('历史参数未完整记录，分析使用当前PnP配置；结论须结合当时配置核对。')
     if not report['final_horizontal_error_m']['samples']:

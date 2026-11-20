@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 import json
+import csv
 import math
 from pathlib import Path
 
@@ -13,7 +14,7 @@ def distribution(values):
             'p95':values[round((len(values)-1)*.95)] if values else None}
 
 
-def summarize(path):
+def summarize_legacy(path):
     records,invalid = [],[]
     with Path(path).open() as stream:
         for line_number,line in enumerate(stream,1):
@@ -102,6 +103,102 @@ def summarize(path):
         'limitation':'REQUEST_TX observes the write API; replies observe parser processing. Unfinished requests at file end may still be in flight. Missing replies cannot by themselves distinguish link loss, peer silence, or delayed processing. This report does not declare a unique root cause.'}
 
 
+
+_COUNTERS = ('bad_crc','rx_out_of_order','reply_mismatch','sync_timeouts','tx_dropped','events_dropped')
+_TEXT_FIELDS = ('event','reason')
+
+
+def summarize_compact(path):
+    """Analyze periodic summaries and sparse actual decisions, not every packet."""
+    records,invalid = [],[]
+    with Path(path).open(newline='') as stream:
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames or []
+        if not {'local_us','event'}.issubset(fields):
+            raise ValueError('Not a communication CSV: local_us/event columns are required')
+        for line_number,row in enumerate(reader,2):
+            if None in row or any(value is None for value in row.values()):
+                invalid.append(line_number)
+                continue
+            try:
+                record = {}
+                for key,value in row.items():
+                    if key in _TEXT_FIELDS:
+                        record[key] = value
+                    elif not value:
+                        record[key] = None
+                    else:
+                        if value.lstrip('+-').isdigit():
+                            record[key] = int(value)
+                        else:
+                            number = float(value)
+                            if not math.isfinite(number):
+                                raise ValueError('Non-finite numeric value')
+                            record[key] = number
+                if record.get('local_us') is None or not record.get('event'):
+                    raise ValueError('Missing time/event')
+                records.append(record)
+            except (TypeError,ValueError):
+                invalid.append(line_number)
+    snapshots = [r for r in records if r['event']=='SNAPSHOT']
+    events = [r for r in records if r['event']!='SNAPSHOT']
+    outcomes = Counter(r['event'] for r in events)
+    counter_increase = {key:0 for key in _COUNTERS}
+    counter_resets = {key:0 for key in _COUNTERS}
+    previous = {}
+    for row in records:
+        for key in _COUNTERS:
+            value = row.get(key)
+            if value is None:
+                continue
+            if key in previous:
+                if value >= previous[key]:
+                    counter_increase[key] += value-previous[key]
+                else:
+                    counter_resets[key] += 1
+                    counter_increase[key] += value
+            previous[key] = value
+    timeouts = [r for r in events if r['event'] in ('SYNC_TIMEOUT','ACCEPT_TIMEOUT')
+                or r.get('reason')=='ACCEPT_TIMEOUT']
+    request_timeouts = [r for r in events if r['event']=='SYNC_REPLY_TIMEOUT']
+    dropped = max((r.get('events_dropped') or 0 for r in records),default=0)
+    observations = []
+    if request_timeouts:
+        observations.append('有同步事务等待回复超时；它与5秒未接受有效偏移后的同步失效分别统计。')
+    if counter_increase['reply_mismatch'] or any('MISMATCH' in name or 'NO_PENDING' in name for name in outcomes):
+        observations.append('有无法匹配当前同步事务的回复；它可能是迟到或旧回复，不等于真实时钟跳变。')
+    if counter_increase['rx_out_of_order']:
+        observations.append('收到重复或倒序遥测；这些样本没有作为新的时间推进。')
+    if counter_increase['tx_dropped']:
+        observations.append('存在本机发送丢弃；请结合异常原因区分排队过期和发送失败。')
+    if invalid or dropped:
+        observations.append('存在无效行或诊断缓冲丢事件，不能把日志缺项当作链路没有通信。')
+    if not records:
+        observations.append('没有有效通信记录。')
+    metrics = ('rtt_us','queue_wait_us','poll_gap_us','poll_wall_gap_us','sync_age_us',
+               'heartbeat_age_us','attitude_age_us','velocity_age_us','tx_age_us')
+    result = {
+        'file':str(Path(path).resolve()),'schema':'compact_comm_csv','diagnostic_only':True,
+        'record_count':len(records),'snapshot_count':len(snapshots),'invalid_line_count':len(invalid),
+        'invalid_line_examples':invalid[:10],'event_counts':dict(outcomes),'events_dropped':dropped,
+        'counter_increase_after_first_observation':counter_increase,
+        'counter_resets':counter_resets,'latest_counters':previous,
+        'latest_snapshot':snapshots[-1] if snapshots else None,'timeouts':timeouts,
+        'request_timeouts':request_timeouts,
+        'flight_or_sync_reasons':dict(Counter(r.get('reason') for r in snapshots if r.get('reason'))),
+        'observations':observations,
+        'metric_sampling':'Periodic snapshots and abnormal events; distributions are sampled diagnostics, not all-packet latency percentiles.',
+        'limitation':'Timestamps observe write/receive-processing APIs, not physical wire arrival or PX4 execution ACK. Counter increases exclude counts already present at the first observation. Missing replies alone do not identify a unique cause.',
+    }
+    result.update({key:distribution([r.get(key) for r in records
+        if key!='rtt_us' or r.get('event')!='SYNC_REPLY_TIMEOUT']) for key in metrics})
+    result['request_wait_us']=distribution([r.get('rtt_us') for r in request_timeouts])
+    return result
+
+
+def summarize(path):
+    return summarize_compact(path) if Path(path).suffix.lower()=='.csv' else summarize_legacy(path)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('log',nargs='?')
@@ -112,8 +209,10 @@ def main():
     if args.latest:
         candidates = list(Path(args.log_dir).glob('pnp_sim_*_sync.jsonl'))
         candidates += list(Path(args.log_dir).glob('pnp_sync_*.jsonl'))
+        candidates += list(Path(args.log_dir).glob('*_sync.csv'))
+        candidates += list(Path(args.log_dir).glob('pnp_comm_*.csv'))
         if not candidates:
-            parser.error('No synchronization diagnostic logs found; restart the instrumented simulation first')
+            parser.error('No communication diagnostic logs found')
         path = max(candidates,key=lambda p:p.stat().st_mtime_ns)
     elif args.log:
         path = Path(args.log)

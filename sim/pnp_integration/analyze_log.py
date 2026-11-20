@@ -6,6 +6,7 @@ from collections import Counter
 import csv
 import json
 import math
+import os
 from pathlib import Path
 import runpy
 
@@ -66,7 +67,8 @@ def read_rows(path):
     with Path(path).open(newline='') as stream:
         reader=csv.DictReader(stream)
         fields=reader.fieldnames or []
-        schema=('pnp' if 'capture_time_us' in fields else 'legacy_sim')
+        schema=('compact_pnp' if 'control_capture_time_us' in fields and 'attitude_status' in fields
+                else 'pnp' if 'capture_time_us' in fields else 'legacy_sim')
         for row in reader:
             if None in row or any(value is None for value in row.values()):
                 skipped+=1
@@ -93,7 +95,8 @@ def read_rows(path):
             rows.append(row)
     return rows,{'schema':schema,'skipped_rows':skipped,'clock_resets':resets,
                  'duplicate_timestamps':duplicates,
-                 'control_input_recorded':'control_track' in fields}
+                 'control_input_recorded':'control_track' in fields,
+                 'control_source_recorded':'control_capture_time_us' in fields}
 
 
 def last_epoch(rows):
@@ -109,7 +112,15 @@ def select_csv(path=None,latest=False,log_dir=None):
         raise ValueError('Choose CSV or --latest, not both')
     if latest:
         directory=Path(log_dir) if log_dir else Path(__file__).resolve().parents[1]/'logs'
-        candidates=list(directory.glob('pnp_sim_*.csv'))
+        candidates=[]
+        for item in directory.glob('pnp_sim_*.csv'):
+            if item.name.endswith(('_sync.csv','_comm.csv')):
+                continue
+            with item.open(newline='') as stream:
+                header=next(csv.reader(stream),[])
+            if {'local_us','event'}.issubset(header) and not {'capture_time_us','sim_time_s'}.intersection(header):
+                continue
+            candidates.append(item)
         if not candidates:
             raise ValueError('No simulation CSV logs found')
         return max(candidates,key=lambda item:item.stat().st_mtime_ns)
@@ -120,7 +131,7 @@ def select_csv(path=None,latest=False,log_dir=None):
 
 def run_settings(path):
     """Use recorded PnP values; old logs fall back to the current source."""
-    directory=Path(__file__).resolve().parents[2]/'PnP'
+    directory=Path(os.environ.get('PNP_ALGORITHM_DIR',str(Path(__file__).resolve().parents[2]/'PnP')))
     current=runpy.run_path(str(directory/'config.py'))
     metadata_path=Path(path).with_suffix('.json')
     try:
@@ -137,9 +148,13 @@ def run_settings(path):
     interval=metadata.get('log_interval_ms')
     if interval is None:
         tree=ast.parse((directory/'main.py').read_text())
-        assignment=next(node for node in tree.body if isinstance(node,ast.Assign)
-                        and any(isinstance(t,ast.Name) and t.id=='POSE_LOG_INTERVAL_MS' for t in node.targets))
-        interval=ast.literal_eval(assignment.value)
+        assignment=next((node for node in tree.body if isinstance(node,ast.Assign)
+                        and any(isinstance(t,ast.Name) and t.id=='POSE_LOG_INTERVAL_MS' for t in node.targets)),None)
+        if assignment is not None:
+            try:
+                interval=ast.literal_eval(assignment.value)
+            except (TypeError,ValueError):
+                interval=None
     values['log_interval_ms']=interval
     for key in (*names,'log_interval_ms'):
         try:
@@ -185,9 +200,11 @@ def summarize(path,last_seconds=None):
         notes.append('没有完整的有效时间戳记录。')
     if not vision:
         notes.append('记录处于待命，没有识别样本；IDLE不计入识别失败率。')
-    if not camera['samples']:
+    if quality['schema']=='compact_pnp':
+        notes.append('精简格式只比较采集时原始相对位置与同刻真值；控制时位置不与采集时真值比较。')
+    elif not camera['samples']:
         notes.append('没有有效PnP与对应真值，不能将缺少误差样本视为零误差。')
-    if quality['schema']!='pnp':
+    if quality['schema']=='legacy_sim':
         notes.append('历史字段仅在读取时转换；未记录的控制端状态不补造。')
     if quality['clock_resets']:
         notes.append('存在时钟回退；--last-seconds只选择最后一个时间段。')
@@ -203,6 +220,11 @@ def summarize(path,last_seconds=None):
             'reprojection_px':stats([number(r,'reprojection_px') for r in vision if flag(r,'pose_valid')]),
             'solve_ms':stats([number(r,'solve_ms') for r in vision]),
             'observation_age_ms':stats([number(r,'observation_age_ms') for r in vision]),
+            'attitude_match_states':counts(vision,'attitude_status'),
+            'velocity_age_ms':stats([number(r,'velocity_age_ms') for r in vision]),
+            'tx_image_age_ms':stats([number(r,'tx_image_age_ms') for r in rows]),
+            'capture_to_control_ms':stats([(number(r,'control_time_us')-number(r,'control_capture_time_us'))*.001
+                for r in rows if number(r,'control_time_us') is not None and number(r,'control_capture_time_us') is not None]),
             'absolute_truth_dt_us':stats([abs(number(r,'truth_dt_us')) for r in vision if number(r,'truth_dt_us') is not None]),
             'notes':notes}
 

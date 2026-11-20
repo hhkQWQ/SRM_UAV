@@ -25,7 +25,7 @@ from algorithm_core import Algorithm, quaternion_from_rotation
 from camera_mount import read_camera_mount
 from gazebo_truth import GroundTruth
 from udp_uart import UdpUart
-from sync_diagnostics import diagnostic_link, SyncJSONLogger
+from link_service import ThreadSafeLink
 
 
 def stamp_us(stamp):
@@ -46,7 +46,6 @@ def finite_json(value):
 
 # All operational fields come from PnP. Only aligned ground truth is appended.
 TRUTH_FIELDS = (
-    'true_p_C_x_m','true_p_C_y_m','true_p_C_z_m',
     'true_p_local_x_m','true_p_local_y_m','true_p_local_z_m',
     'truth_dt_us','truth_source',
 )
@@ -76,6 +75,7 @@ class PnpNode(Node):
         self.last_report_wall = 0.
         self.last_warning_wall = 0.
         self.last_csv_us = None
+        self.last_log_state = None
         self.last_flush_wall = 0.
         self.frame_count = 0
         self.drop_count = 0
@@ -89,9 +89,8 @@ class PnpNode(Node):
         if not options.no_mavlink:
             try:
                 self.transport = UdpUart(options.mavlink_port)
-                self.link = diagnostic_link(
-                    self.algorithm.modules.link,self.algorithm.config,
-                    uart=self.transport,clock=self.truth)
+                self.link = ThreadSafeLink(self.algorithm.modules.link.FlightLink(
+                    uart=self.transport,clock=self.truth))
             except OSError as error:
                 if options.enable_control:
                     raise
@@ -115,7 +114,10 @@ class PnpNode(Node):
         self.csv_fields = self.runtime.POSE_LOG_FIELDS + TRUTH_FIELDS
         self.csv = csv.DictWriter(self.csv_file, fieldnames=self.csv_fields)
         self.csv.writeheader()
-        settings = {
+        settings = self.runtime.run_metadata()
+        settings.update({
+            'clock': 'Gazebo simulation microseconds; remote=local+offset_us',
+            'scheduling_clock': 'host monotonic; 2 ms target communication polling interval',
             'mode': 'manual_offboard' if options.enable_control else 'observe',
             'algorithm_dir': str(Path(options.algorithm_dir).resolve()),
             'simulation_overrides': {
@@ -135,21 +137,21 @@ class PnpNode(Node):
             'ground_truth_policy': 'aligned error statistics only; never an attitude, position or control input',
             'options': vars(options),
             'control_policy': 'Shared PnP VisualServo; Position zero-velocity priming, pilot selects Offboard; fresh MEASURED/PREDICTED may navigate; no mission upload or automatic Offboard request',
-            'log_schema': 'PnP POSE_LOG_FIELDS plus 8 aligned truth fields; no aliases',
+            'log_schema': 'Compact shared PnP control fields plus 5 aligned truth fields; no aliases',
             'csv_fields': self.csv_fields,
             'log_interval_ms': self.runtime.POSE_LOG_INTERVAL_MS,
             'control_config': {key:getattr(self.algorithm.config,key) for key in
                 ('TARGET_HEIGHT_M','KP_XY','KP_Z','MAX_SPEED_XY','MAX_SPEED_Z',
                  'MAX_ACCEL_XY','MAX_ACCEL_Z','CONTROL_INTERVAL_MS','LOST_BRAKE_MS',
                  'MAX_PREDICTION_MS','ARRIVAL_XY_M','ARRIVAL_Z_M','ARRIVAL_DWELL_MS')},
-        }
+        })
         self.settings = settings
         self.settings_path = log_dir / f'{name}.json'
         self.settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
         self.sync_logger = None
         self.last_sync_log_error = None
         if self.link:
-            sync_path = str(log_dir / f'{name}_sync.jsonl')
+            sync_path = str(log_dir / f'{name}_sync.csv')
             source_info = {'algorithm_dir':str(Path(options.algorithm_dir).resolve())}
             try:
                 for label,path in (
@@ -160,17 +162,19 @@ class PnpNode(Node):
                     ('servo_sha256',Path(options.algorithm_dir)/'visual_servo.py'),
                     ('detector_sha256',Path(options.algorithm_dir)/'armor_detect.py'),
                     ('pose_solver_sha256',Path(options.algorithm_dir)/'pose_solver.py'),
-                    ('observer_sha256',Path(__file__).with_name('sync_diagnostics.py'))):
+                    ('link_service_sha256',Path(__file__).with_name('link_service.py'))):
                     source_info[label] = hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError as error:
                 source_info['hash_error'] = str(error)
-            self.sync_logger = SyncJSONLogger(self.link,sync_path,metadata=source_info)
-            self.settings['sync_diagnostics'] = {'path':sync_path,'limits':self.link.sync_limits(),
+            self.sync_logger = self.algorithm.modules.comm_log.CommCSVLogger(
+                self.link,sync_path,clock=self.truth,interval_ms=1000)
+            self.settings['sync_diagnostics'] = {'path':sync_path,
                 'source':source_info,
-                'policy':'Diagnostic events and independent 1 Hz snapshots; synchronization decisions unchanged',
-                'time_observation':'UART/socket write and parser processing times; not wire/hardware arrival times'}
+                'policy':'Shared PnP synchronization decisions; compact 1 Hz summaries plus anomaly events',
+                'time_observation':'Request stamped at write and fresh receive processing time; not hardware timestamps'}
             self.settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
             self.get_logger().info(f'TIMESYNC diagnostics={sync_path}')
+            self.link.start()
         self.timer = self.create_timer(.01, self.on_tick)
         self.get_logger().info(f'Mode={settings["mode"]}; CSV={self.csv_path}')
         self.get_logger().info('Waiting for image, CameraInfo and Gazebo simulation clock')
@@ -195,6 +199,11 @@ class PnpNode(Node):
                     'processing_intrinsics': self.algorithm.config.INTRINSICS,
                     'resize': 'INTER_AREA; pixel-center mapping',
                 }
+                # The static metadata is written before CameraInfo arrives;
+                # refresh its camera values to the actual processing K/D.
+                self.settings['camera'].update(
+                    intrinsics=self.algorithm.config.INTRINSICS,
+                    distortion=self.algorithm.config.DIST_COEFFS)
                 self.settings_path.write_text(json.dumps(self.settings,indent=2,ensure_ascii=False))
                 self.last_result = None
         except (ValueError, TypeError) as error:
@@ -213,9 +222,13 @@ class PnpNode(Node):
             self.last_warning_wall = now
 
     def flight_state(self, now):
-        return (self.link.state(now) if self.link else
-                {'ready': False, 'reason': 'MAVLINK_UNAVAILABLE', 'armed': False,
-                 'offboard': False, 'yaw': 0., 'velocity': None})
+        if self.link:
+            with self.link.lock:
+                # The worker may have received newer telemetry since the
+                # caller sampled time. Never compare it to an older timestamp.
+                return self.link.state(self.truth.now_us())
+        return {'ready': False, 'reason': 'MAVLINK_UNAVAILABLE', 'armed': False,
+                'offboard': False, 'yaw': 0., 'velocity': None}
 
     def on_tick(self):
         tick_started = time.monotonic()
@@ -226,8 +239,10 @@ class PnpNode(Node):
             self.last_result = self.last_frame_us = self.last_image_us = None
             self.last_control_us = now
             self.last_csv_us = None
+            self.last_log_state = None
+            self.pending.clear()
             if self.link:
-                self.link._restart()
+                self.link.reset_clock_generation(self.generation)
         if now <= 0:
             self.record_sync_diagnostics(tick_started)
             self.warn('Waiting for Gazebo /clock')
@@ -263,7 +278,7 @@ class PnpNode(Node):
         now = self.truth.now_us()
         if now-self.last_control_us >= self.algorithm.config.CONTROL_INTERVAL_MS*1000:
             self.control_tick(now)
-            self.last_control_us = now
+            self.last_control_us = self.control_time_us
         if self.link:
             self.link.poll()
         self.record_sync_diagnostics(tick_started)
@@ -279,14 +294,7 @@ class PnpNode(Node):
     def record_sync_diagnostics(self, tick_started):
         if self.sync_logger is None:
             return
-        flight = self.flight_state(self.truth.now_us())
-        self.sync_logger.record(context={
-            'flight':flight['reason'],'main_mode':flight.get('main_mode'),
-            'sub_mode':flight.get('sub_mode'),'armed':flight['armed'],'offboard':flight['offboard'],
-            'nav':self.controller_state(),'vision_enabled':self.vision_enabled,
-            'control_track':self.control_track.get('state') if self.control_track else None,
-            'simulation_generation':self.truth.generation,'last_frame_us':self.last_frame_us,
-            'tick_work_wall_us':round((time.monotonic()-tick_started)*1e6)})
+        self.sync_logger.record()
         if self.sync_logger.error and self.sync_logger.error != self.last_sync_log_error:
             self.get_logger().warning(f'TIMESYNC diagnostic log stopped: {self.sync_logger.error}')
             self.last_sync_log_error = self.sync_logger.error
@@ -306,7 +314,10 @@ class PnpNode(Node):
         now = self.truth.now_us()
         if now-self.last_control_us >= self.algorithm.config.CONTROL_INTERVAL_MS*1000:
             self.control_tick(now)
-            self.last_control_us = now
+            self.last_control_us = self.control_time_us
+        if self.link:
+            self.link.poll()
+        now = self.truth.now_us()
         flight = self.flight_state(now)
         values = self.runtime.pose_log_row(
             self.frame_count,capture,now,None,(time.perf_counter()-started)*1e6,
@@ -317,10 +328,8 @@ class PnpNode(Node):
         row = dict(zip(self.runtime.POSE_LOG_FIELDS,values))
         row.update({key:None for key in TRUTH_FIELDS})
         if truth is not None:
-            for prefix,value in (('true_p_C',truth['p_camera_true']),
-                                 ('true_p_local',truth['relative_ned_true'])):
-                for axis,component in zip(('x','y','z'),value):
-                    row[f'{prefix}_{axis}_m'] = component
+            for axis,component in zip(('x','y','z'),truth['relative_ned_true']):
+                row[f'true_p_local_{axis}_m'] = component
             row['truth_dt_us'],row['truth_source'] = truth.get('truth_dt_us'),truth.get('source')
         self.status_publisher.publish(String(data=json.dumps(finite_json(row),allow_nan=False)))
         pose = result['pose']
@@ -344,9 +353,13 @@ class PnpNode(Node):
         debug = self.bridge.cv2_to_imgmsg(debug_frame,encoding='bgr8')
         debug.header = message.header
         self.image_publisher.publish(debug)
-        if self.last_csv_us is None or now-self.last_csv_us >= self.runtime.POSE_LOG_INTERVAL_MS*1000:
+        state = self.runtime.log_state_key(row.get('track'),row.get('nav'),flight,
+                                           result.get('alignment',{}))
+        if (self.last_csv_us is None or state != self.last_log_state or
+                now-self.last_csv_us >= self.runtime.POSE_LOG_INTERVAL_MS*1000):
             self.record(row)
             self.last_csv_us = now
+            self.last_log_state = state
         wall = time.monotonic()
         if wall-self.last_report_wall >= self.algorithm.config.DEBUG_PRINT_INTERVAL_MS*.001:
             self.get_logger().info(
@@ -377,12 +390,19 @@ class PnpNode(Node):
         def value(key):
             v = row.get(key)
             return '--' if v is None else f'{v:.3f}'
+        def position(axis):
+            v = row.get(f'control_p_local_{axis}_m')
+            if v is None:
+                v = row.get(f'p_local_raw_{axis}_m')
+            return '--' if v is None else f'{v:.3f}'
+        solve_ms = None if result.get('solve_us') is None else result['solve_us']*.001
+        solve_text = '--' if solve_ms is None else f'{solve_ms:.3f}'
         lines = [f'track={row["track"]} | nav={row["nav"]}',
                  f'armed={row["armed"]} offboard={row["offboard"]} | flight={row["flight"]}',
                  f'vision_enabled={row["vision_enabled"]} | observation_age_ms={value("observation_age_ms")}',
-                 f'p_local N/E/D: {value("p_local_x_m")} / {value("p_local_y_m")} / {value("p_local_z_m")} m',
+                 f'p_local N/E/D: {position("x")} / {position("y")} / {position("z")} m',
                  f'command N/E/D: {value("command_vn_mps")} / {value("command_ve_mps")} / {value("command_vd_mps")} m/s',
-                 f'fps={value("fps")} solve_ms={value("solve_ms")} submitted={row["setpoint_submitted"]}']
+                 f'attitude={row.get("attitude_status","--")} solve_ms={solve_text} submitted={row["setpoint_submitted"]}']
         for i,line in enumerate(lines):
             position=(12,26+i*27)
             cv2.putText(frame,line,position,cv2.FONT_HERSHEY_SIMPLEX,.56,(0,0,0),4,cv2.LINE_AA)
@@ -392,9 +412,20 @@ class PnpNode(Node):
         return self.algorithm.control_servo.state
 
     def control_tick(self, now):
+        if self.link:
+            with self.link.lock:
+                # State, history integration and submitted reference must use
+                # one consistent clock generation. This lock covers only the
+                # short control calculation, never image processing or I/O logs.
+                return self._control_tick(self.truth.now_us())
+        return self._control_tick(now)
+
+    def _control_tick(self, now):
         result = self.last_result
         track = (result['track'] if result is not None else
                  {'position':None,'state':'IDLE' if not self.vision_enabled else 'LOST','generation':0})
+        if result is not None and self.link and result.get('link_generation') != self.link.generation:
+            track = dict(track,position=None,state='LOST')
         stamp = result['stamp_us'] if result is not None else now
         self.control_track,self.last_command,self.setpoint_submitted = self.runtime.update_control(
             track,self.flight_state(now),stamp,now,self.algorithm.control_servo,self.link)
@@ -404,6 +435,8 @@ class PnpNode(Node):
         self.csv.writerow(row)
 
     def close(self):
+        if self.link:
+            self.link.close()
         if self.sync_logger:
             self.sync_logger.close()
         if self.link:

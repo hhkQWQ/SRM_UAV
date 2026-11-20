@@ -42,25 +42,39 @@ ros2 run rqt_image_view rqt_image_view /pnp/debug_image
 
 真值缺失不等待、不阻止识别或导航。场景靶面世界高度1.5米，建议先在靶面上方2～3米粗导航，最终机体距靶面1米；目标位置只由视觉反馈取得。现有SITL传感器配置不变，不代表已验证MTF-02的无GPS融合。
 
+## 通信与时间对齐
+
+板端和仿真共用 `PnP/flight_link.py` 的收发、同步、历史查询和诊断决策。TIMESYNC在即将开始write时取发送时间，零字节重试重新记时，部分发送后续发原报文；每份接收消息重新取时。发送排队单独记录，不再作为时钟偏移的一部分。
+
+恢复阶段200ms采样、稳定后1秒采样，至少3个近期一致样本后同步。低RTT样本和中位数抑制离群点，连续一致的偏移变化允许重新收敛；确认的大幅变化或时钟回退使旧观测失效。30ms RTT上限、5秒同步有效期以及姿态和速度时效保护仍由共用配置管理。
+
+仿真新增独立通信线程，调度目标约2ms。短锁只保护链路状态操作，图像计算和日志写盘在锁外执行；实际服务间隔以日志为准。线程异常使健康原因变成 `LINK_WORKER_FAILED`，不继续正常目标引导。板端仍采用取图前最长约30ms的有界同步应答窗口与处理阶段轮询。
+
+姿态按采集时刻插值或受限外推，速度按历史插值。控制位置通过采集到控制之间的速度积分补偿，无法覆盖的时间段不使用旧目标位置。真值缺失不等待，单帧姿态缺失不额外清空跟踪器；两者都使用共用PnP规则。
+
+Gazebo时钟负责物理时间、图像和控制时刻；电脑单调时钟只用于通信线程调度和日志刷新。暂停不会用电脑时间推进目标预测，回退会清理旧时间映射。软件write时刻不是硬件线路到达时间，实际PX4执行也不能由write直接确认。
+
 ## 字段与画面
 
-CSV、`/pnp/status`和画面使用同一套PnP字段。新日志不再写 `track_state/control_state/control_submitted`、`sim_time_s` 等旧别名，也不重复保存可从向量计算的误差列。
+CSV、`/pnp/status`和画面使用同一套PnP字段。控制CSV默认5Hz，并补记状态变化。共用控制字段由原70列精简为34列，删除完整四元数/RPY、旋转矩阵、像素角点、相机位置、重复滤波位置、帧率/求解耗时等常驻列；字段全集由 `PnP/main.py` 的 `POSE_LOG_FIELDS` 定义。
 
 | 字段 | 含义 |
 | --- | --- |
-| `capture_time_us/log_time_us/control_time_us` | 图像、记录、控制时刻，单位微秒，使用同一Gazebo时间域 |
-| `vision_enabled/track/control_track/nav` | 是否识别、图像跟踪状态、控制端实际使用状态、控制器行为 |
-| `armed/offboard/main_mode/sub_mode/flight` | 实际飞控模式与遥测健康原因 |
-| `pose_valid/relative_valid/observation_age_ms` | PnP、坐标变换有效性和真实观测年龄 |
-| `p_C_x_m/y_m/z_m` | 相机系目标位置 |
-| `p_local_raw_x_m/y_m/z_m` | 当前真实三维观测的NED相对位置 |
-| `p_local_x_m/y_m/z_m` | 跟踪器滤波或预测后的NED相对位置 |
-| `command_vn_mps/ve_mps/vd_mps/setpoint_submitted` | 速度参考和发送缓冲提交结果，不等于飞控执行ACK |
-| `fps/solve_ms/reprojection_px` | 帧率、求解耗时与重投影误差 |
+| `frame_id/capture_time_us` | 当前图像编号与采集时间 |
+| `control_time_us/control_capture_time_us/link_generation` | 控制时间、实际使用的源图像时间和观测链路代数 |
+| `vision_enabled/track/control_track/nav/flight` | 识别门控、图像与控制端目标状态、控制行为和健康原因 |
+| `armed/offboard` | PX4实际解锁及Offboard状态 |
+| `pose_valid/pose_reason/relative_valid/relative_reason/reprojection_px` | 区分视觉求解、姿态匹配和坐标变换问题 |
+| `attitude_status/attitude_before_dt_ms/attitude_after_dt_ms/velocity_age_ms` | 采集时刻的遥测匹配情况 |
+| `observation_age_ms` | 最近真实三维观测年龄 |
+| `p_local_raw_x_m/y_m/z_m` | 采集时的原始NED相对位置 |
+| `control_p_local_x_m/y_m/z_m` | 实际用于控制的延迟补偿后位置，不能直接与采集时真值相减 |
+| `command_vn_mps/ve_mps/vd_mps/setpoint_submitted` | 速度参考和发送缓冲提交结果 |
+| `tx_status/tx_image_age_ms` | 发送状态和已write参考的源图像年龄，不等于PX4执行ACK |
 
-仿真只附加8个对齐真值字段：`true_p_C_x_m/y_m/z_m`、`true_p_local_x_m/y_m/z_m`、`truth_dt_us`、`truth_source`。这些字段不进入控制。ROS图像不提供采集耗时，所以 `capture_ms` 留空。
+仿真只附加5个采集时真值字段：`true_p_local_x_m/y_m/z_m`、`truth_dt_us`、`truth_source`。有可靠对齐数据才写真值，缺失留空；这些字段不进入控制。原始相对位置与真值在同一采集时间比较，控制时位置不与采集时真值比较。
 
-日志保存在 `sim/logs`，历史CSV/JSON/同步诊断不改写。修改源码后重启算法才能生效，不要同时运行两个占用UDP14540的算法进程。
+日志保存在 `sim/logs`。`pnp_sim_时间.csv/json`记录控制数据及当次配置；`pnp_sim_时间_sync.csv`是23列的精简通信记录。历史CSV、JSON和JSONL保持原样。修改源码后重启算法才能生效，不要同时运行两个占用UDP14540的算法进程。
 
 ## 分析工具
 
@@ -70,41 +84,13 @@ python3 /home/hhkqwq/SRM_UAV/sim/pnp_integration/analyze_navigation.py --latest
 python3 /home/hhkqwq/SRM_UAV/sim/pnp_integration/analyze_sync.py --latest
 ```
 
-- `analyze_log.py`：按新向量字段计算相机、原始相对位置、滤波/预测位置误差；报告状态计数、耗时和观测年龄。识别有效率以实际识别样本为分母，不把IDLE算作识别失败。缺少真值不当作零误差。
-- `analyze_navigation.py`：选择最后一段实际已解锁Offboard记录，分析末尾窗口；停机后的IDLE不覆盖上一段结果。`passed`仅表示末段连续采样满足PnP自身 `ARRIVAL_XY_M/ARRIVAL_Z_M/ARRIVAL_DWELL_MS`，并且控制器为HOLD、采用MEASURED、参考已提交。PREDICTED正常计入导航，但和原控制器一样不建立到位确认。不再使用另设的10cm、95%导航或90%实测通过门槛。
-- 到位参数与日志间隔优先取同名JSON中的当次PnP配置；历史记录不完整时明确标注当前配置回退。采样间隔超过两倍记录周期会中断到位证据，防止仅两个稀疏样本被当作持续悬停。
-- 旧字段只在分析读取时转换，不写回历史日志；未记录的控制端输入不补造。工具报告残缺行、时钟回退和重复时间戳，输出统一为JSON。
-- `analyze_sync.py`保留原同步原因分析，状态上下文改用同一 `nav/flight/control_track`，不改变同步判定或飞控通信。
+- `analyze_log.py`读取精简格式和历史格式。新格式只计算采集时原始相对位置与同刻真值误差，不补造已经移除的相机/滤波位置误差。待命IDLE不计为识别失败，缺少真值不当作零误差；飞行日志选择会排除通信CSV。
+- `analyze_navigation.py`选择最后一段实际已解锁Offboard记录，按当次PnP的 `ARRIVAL_XY_M/ARRIVAL_Z_M/ARRIVAL_DWELL_MS` 检查采样HOLD。新格式要求控制源图像时间等于对应真值图像时间；PREDICTED计入有效导航但不建立到位确认。真值检查位于源图像采集时刻，不代表稍后的发送或执行时刻。
+- 到位参数与日志间隔优先取同名JSON中的运行配置；历史缺项会标注当前配置回退。采样间隔超过两倍记录周期会中断持续到位证据，未记录的控制输入或源图像关联不补造。
+- `analyze_sync.py`同时支持新的 `*_sync.csv` 和旧的 `*_sync.jsonl`。新格式只周期性摘要及稀疏异常事件，报告的是采样延迟分布，不宣称全包P95。`request_timeouts`是请求等待超时，`timeouts`是5秒有效映射失效；等待时长不混入实测RTT分布。
 
-2026-11-19：24项离线验证覆盖共享调用、板端主循环、导航条件、字段一致性及分析边界；Python/Shell语法检查通过。未启动Gazebo完整闭环或进行实机飞行，项目不保留临时测试文件。板端说明见 [PnP/README.md](/home/hhkqwq/SRM_UAV/PnP/README.md)。
+通信CSV直接记录共用FlightLink实际决策：偏移、RTT/创新量、同步年龄、排队等待、心跳/姿态/速度采样年龄、累计最大服务间隔、发送年龄和必要异常计数。删除每条事件重复的完整快照、Mission上下文和每次正常交换记录。`poll_gap_us/poll_wall_gap_us`分别是物理时间与电脑单调时间下启动以来的最大服务间隔；异常行只填相关字段，空值不当作零。
 
-## 时钟同步诊断（仅sim内修改）
+通信日志按电脑时间约每1秒刷新摘要，即使仿真暂停也可记录状态；物理时效仍用Gazebo时间。诊断缓冲有界，溢出计入 `events_dropped`，写盘失败只停止相应日志并提示。正常退出刷新，强制终止可能留下残缺末行；分析器会报告无效行。缺少回复本身不能区分对端未回、丢包或处理延迟。
 
-sim在原始 `PnP/flight_link.py` 的类外附加诊断包装：收包、发送、轮询和同步判断仍执行原方法，包装只观察调用前后状态。PnP源码、阈值和导航逻辑保持原样；无需修改启动命令。
-
-算法启动日志显示 `TIMESYNC diagnostics=完整路径`，独立日志为 `sim/logs/pnp_sim_时间_sync.jsonl`。停止旧仿真、重新启动后自行复现 `TIME_UNSYNCED`，运行：
-
-```bash
-python3 /home/hhkqwq/SRM_UAV/sim/pnp_integration/analyze_sync.py --latest
-```
-
-`timeouts` 列出每次超时前的最近回复，以及自上次接受样本以来的拒收次数；`event_counts` 汇总实际观察到的分支。文件中记录原始模块文件SHA-256，便于确认本轮运行的源码版本。
-
-| 事件/字段 | 能确认的现象 |
-| --- | --- |
-| `REQUEST_QUEUED` / `REQUEST_QUEUE_FULL` | 同步请求入队或入队失败 |
-| `REQUEST_TX.queue_wait_us` | 请求排队至UART/socket write的耗时 |
-| `REJECT_RTT.rtt_us` | 原程序使用的请求至回复处理间隔被判超限 |
-| `REJECT_JITTER.innovation_us` | 偏移样本超过滤波阈值，原程序未接受该样本 |
-| `ACCEPT_INITIAL` / `ACCEPT_FILTER` / `ACCEPT_RESET` | 观察到原程序建立偏移、正常更新或重置 |
-| `REPLY_TOKEN_MISMATCH` / `REPLY_NO_PENDING` / `REQUEST_REPLACED` | 无法匹配当前请求的回复或旧请求被替换 |
-| `BOOT_BACKWARD` / `LOCAL_CLOCK_BACKWARD` | 飞控启动时间或本地观察时间回退 |
-| `SYNC_STATUS.reason` | 无偏移、样本不足、接受超时等具体同步状态 |
-| `poll_gap_us` / `poll_wall_gap_us` | 仿真时钟和电脑单调时钟下的轮询间隔 |
-| `prior_export_wall_us` / `max_export_wall_us` | 上次和最长日志导出耗时，检查记录本身的影响 |
-
-记录独立于相机帧，只要sim计时器继续运行，仿真时钟暂停时也可按电脑时间写快照。`local_us`沿用原模块时钟，`wall_us`为电脑单调时钟，`remote_us`来自PX4回复。回复的 `local_us` 是原poll使用的时间戳，`observed_local_us` 为包装处理回复后的观察时刻。
-
-事件缓冲128项，溢出计入 `events_dropped`；文件写入失败只停止诊断导出并提示。正常退出刷新，强制终止可能留下不完整末行或丢失末尾缓冲，分析工具会提示可观察到的缺失。
-
-发送记录是write API观察时刻，接收记录是poll/解析观察时刻，均非线路或硬件到达时间戳。`drain_context`是导出时状态，不是每个事件发生时的精确状态。缺少回复不能单独区分飞控未回复、链路丢包和接收处理延迟；必要时仍需飞控端日志或抓包。报告只列证据，不宣称唯一根因。
+2026-11-19：本次验证覆盖共用同步收发、重试、时钟恢复、速度积分、缺测行为、日志格式与旧数据读取，临时脚本完成后清理。没有启动Gazebo完整闭环或进行实机飞行，离线验证不等同于悬停效果通过。板端说明见 [PnP/README.md](/home/hhkqwq/SRM_UAV/PnP/README.md)。
