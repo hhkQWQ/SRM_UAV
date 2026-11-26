@@ -239,12 +239,14 @@ class PlanarPoseSolver:
         r2 = tuple(-first[i]*s+second[i]*c for i in range(3))
         return transpose((r1,r2,normal)),(tx*depth,ty*depth,depth)
 
-    def _refine(self, r, t, observations, normal=None):
+    def _refine(self, r, t, observations, normal=None, service=None):
         cost = self._cost(r,t,observations)[0]
         damping, used = 1e-3, 0
         dimensions = 6 if normal is None else 4
         rotation_dimensions = dimensions-3
         for _ in range(self.iterations):
+            if service:
+                service('pnp')
             if cost < 1e-10:
                 break
             _, a, b = self._cost(r,t,observations,True,normal)
@@ -271,27 +273,29 @@ class PlanarPoseSolver:
                 damping *= 10.
         return r,t,cost,used
 
-    def solve(self, pixels, previous=None, normal_camera=None):
+    def solve(self, pixels, previous=None, normal_camera=None, service=None):
         """normal_camera非空表示已知靶面法向；不把该先验当作测得的法向。"""
         if not quad_valid(pixels, C.MIN_QUAD_AREA_PX2, C.MIN_EDGE_PX):
             return {"valid":False, "reason":"POINT_GEOMETRY"}
         try:
             observations = tuple(self.undistort(p) for p in pixels)
+            if service:
+                service('pnp')
             if normal_camera is not None:
                 if len(normal_camera) != 3 or not finite(normal_camera):
                     raise ValueError("invalid normal")
                 normal = unit(normal_camera)
                 r,t = self._normal_initial(observations,normal)
-                r,t,cost,used = self._refine(r,t,observations,normal)
+                r,t,cost,used = self._refine(r,t,observations,normal,service)
                 mode = "HORIZONTAL"
             else:
                 # 两个起点分别优化后再比较。先按初始误差挑一个，会被旧姿态
                 # 的局部极小值锁住；新的单应候选必须有独立的优化机会。
                 r,t = self._initial(observations)
-                r,t,cost,used = self._refine(r,t,observations)
+                r,t,cost,used = self._refine(r,t,observations,service=service)
                 if previous is not None and previous.get("valid"):
                     try:
-                        pr,pt,pcost,pused = self._refine(previous["rotation"],previous["position"],observations)
+                        pr,pt,pcost,pused = self._refine(previous["rotation"],previous["position"],observations,service=service)
                         used += pused
                         if pcost < cost:
                             r,t,cost = pr,pt,pcost

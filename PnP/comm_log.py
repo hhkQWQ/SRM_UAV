@@ -14,6 +14,11 @@ COMM_LOG_FIELDS = (
     "poll_wall_gap_us", "heartbeat_age_us", "attitude_age_us", "velocity_age_us",
     "bad_crc", "rx_out_of_order", "reply_mismatch", "sync_timeouts", "tx_dropped",
     "events_dropped", "tx_capture_us", "tx_us", "tx_age_us",
+    "rx_bytes", "tx_bytes", "rx_age_us", "rx_frames", "rx_heartbeats",
+    "rx_last_hb_sysid", "rx_last_hb_compid", "rx_last_hb_autopilot",
+    "rx_signed_rejected", "rx_unknown_frames",
+    "armed", "main_mode", "sub_mode", "estimator_flags", "vel_ratio",
+    "estimator_age_us", "setpoint_tx_count", "setpoint_max_gap_us", "delay_us",
 )
 
 _ROUTINE_EVENTS = (

@@ -162,7 +162,7 @@ def _sample_color_diff(img, blob):
     return r - b
 
 
-def detect_lights(img):
+def detect_lights(img, service=None):
     """
     提取红 / 蓝灯条。
     GRAY 模式：亮度阈值提取所有亮斑，再逐根独立判色；
@@ -190,11 +190,15 @@ def detect_lights(img):
         merge=True,
         margin=2,
     )
+    if service:
+        service('detect')
 
     red_lights = []
     blue_lights = []
 
     for blob in blobs:
+        if service:
+            service('detect')
         stats["blobs"] += 1
 
         reason = is_light_strip(blob)
@@ -396,7 +400,7 @@ def calc_pair_score(light1, light2, detail=False):
 # 4. 候选生成与去重（参考同济 sp_vision_25 detector.cpp）
 # ============================================================
 
-def find_candidate_pairs(lights):
+def find_candidate_pairs(lights, service=None):
     """
     两两枚举所有灯条组合，几何合法且 score >= config.MIN_PAIR_SCORE 的进入候选。
     返回 list[candidate dict]，字段：
@@ -413,8 +417,12 @@ def find_candidate_pairs(lights):
         return candidates
 
     for i in range(count):
+        if service:
+            service('pair')
         a = lights[i]
         for j in range(i + 1, count):
+            if service and j % 16 == 0:
+                service('pair')
             b = lights[j]
 
             score = calc_pair_score(a, b)
@@ -454,7 +462,7 @@ def find_candidate_pairs(lights):
     return candidates
 
 
-def dedup_pairs(candidates):
+def dedup_pairs(candidates, service=None):
     """
     按同济 sp_vision_25 detector.cpp 规则去重：
       同侧共用灯条（left==left 或 right==right）-> 保 area 小
@@ -465,10 +473,14 @@ def dedup_pairs(candidates):
     """
     n = len(candidates)
     for i in range(n):
+        if service:
+            service('dedup')
         a = candidates[i]
         if not a["alive"]:
             continue
         for j in range(i + 1, n):
+            if service and j % 16 == 0:
+                service('dedup')
             b = candidates[j]
             if not b["alive"]:
                 continue
@@ -514,17 +526,17 @@ def _draw_candidates(img, lights, survivors):
 # 5. 寻找最佳灯条配对
 # ============================================================
 
-def find_best_pair(lights, debug_img=None):
+def find_best_pair(lights, debug_img=None, service=None):
     """
     候选生成 -> 去重 -> 最高分胜出。
     多装甲板场景下去重可压制与真对共用灯条的高分伪对。
     debug_img 不为 None 时在其上画出保留的候选对。
     """
-    candidates = find_candidate_pairs(lights)
+    candidates = find_candidate_pairs(lights,service)
     if not candidates:
         return None
 
-    survivors = dedup_pairs(candidates)
+    survivors = dedup_pairs(candidates,service)
 
     stats["cand"] += len(candidates)
     stats["dup"] += len(candidates) - len(survivors)

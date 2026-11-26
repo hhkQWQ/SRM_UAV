@@ -103,6 +103,12 @@ def _qmul(a,b):
     v,i,j,k = b
     return (w*v-x*i-y*j-z*k,w*i+x*v+y*k-z*j,w*j-x*k+y*v+z*i,w*k+x*j-y*i+z*v)
 
+def _first_or_none(values):
+    # Some MicroPython builds only support the one-argument form of next().
+    for value in values:
+        return value
+    return None
+
 class FlightLink:
     """Bounded MAVLink service shared by the board and the simulation.
 
@@ -131,6 +137,8 @@ class FlightLink:
         self.queue = []
         self.active = self.latest_setpoint = None
         self.last_rx_us = 0
+        self.rx_bytes = self.tx_bytes = self.rx_frames = self.rx_heartbeats = 0
+        self.last_rx_heartbeat = (None,None,None)
         self.dropped = self.rx_out_of_order = self.reply_mismatch = 0
         self.sync_timeouts = self.request_timeouts = self.events_dropped = 0
         self._comm_events = []
@@ -145,6 +153,13 @@ class FlightLink:
         self._tx_status = 'NONE'
         self._tx_capture_us = self._tx_us = self._tx_age_us = None
         self._tx_control_us = None
+        self.vel_ratio = None
+        self.setpoint_tx_count = self.setpoint_max_gap_us = 0
+        self._setpoint_expected = False
+        self._setpoint_gap_start = None
+        self._setpoint_delay_reported = False
+        self._last_health_reason = None
+        self.service_stage = 'startup'
         self._streams = {mid:{'hz':hz,'attempts':0,'sent':None,'ack':None,
                               'seen':None,'stamp':None,'period':None,'failed':False}
                          for mid,hz in ((31,50),(32,30),(230,5))}
@@ -201,8 +216,10 @@ class FlightLink:
         history.append(item)
         return True
 
-    def _clear_commands(self):
-        if self.active is not None or self.latest_setpoint is not None:
+    def _clear_commands(self, reason='LINK_RESET'):
+        had_commands = self.active is not None or self.latest_setpoint is not None
+        self.cancel_setpoint(reason)
+        if had_commands:
             self.dropped += 1
         self.active = self.latest_setpoint = None
         self.queue = [x for x in self.queue if x[4] is None]
@@ -214,6 +231,8 @@ class FlightLink:
         self.generation += 1
         self.attitudes,self.velocities = [],[]
         self.estimator = self.offset_us = self.pending_sync = self.boot_ms = None
+        self.vel_ratio = None
+        self._last_health_reason = None
         self.sync_count = 0
         self._sync_samples = []
         self._clear_commands()
@@ -245,6 +264,8 @@ class FlightLink:
         now = self.clock.now_us()
         if mid == 0:
             custom,kind,autopilot,base,status,version = struct.unpack('<IBBBBB',padded(payload,9))
+            self.rx_heartbeats += 1
+            self.last_rx_heartbeat = (sysid,compid,autopilot)
             if autopilot != 12 or compid != C.TARGET_COMPONENT:
                 return
             if C.TARGET_SYSTEM is not None and sysid != C.TARGET_SYSTEM:
@@ -252,12 +273,18 @@ class FlightLink:
             if self.target is None:
                 self.target = (sysid,compid)
             if self.target == (sysid,compid):
+                previous_mode = (self.main_mode,self.sub_mode,self.armed)
+                first_heartbeat = self.hb_us == -100000000
                 self.hb_us = now
                 self.armed = bool(base&128)
                 self.main_mode = (custom>>16)&255 if base&1 else 0
                 self.sub_mode = (custom>>24)&255 if base&1 else 0
                 self.offboard = self.main_mode == 6
                 self.mission = self.main_mode == 4 and self.sub_mode == 4
+                if first_heartbeat or previous_mode != (self.main_mode,self.sub_mode,self.armed):
+                    self._event('FLIGHT_MODE',now,
+                                reason='previous=%s' % (str(previous_mode) if not first_heartbeat else 'UNKNOWN'),
+                                armed=self.armed,main_mode=self.main_mode,sub_mode=self.sub_mode)
         if self.target != (sysid,compid):
             return
         if mid == 77:
@@ -265,6 +292,9 @@ class FlightLink:
             if p[8] not in (0,C.SOURCE_SYSTEM) or p[9] not in (0,C.SOURCE_COMPONENT):
                 return
             command,result = struct.unpack('<HB',p[:3])
+            if command == 176:
+                # ACK does not identify a request sequence or prove a mode change.
+                self._event('MODE_ACK',now,reason='command=176 result=%d progress=%d' % (result,p[3]))
             if command == 511 and self._stream_pending is not None:
                 stream = self._streams[self._stream_pending]
                 stream['ack'] = result
@@ -301,6 +331,7 @@ class FlightLink:
             ok = ((flags&7)==7 and not(flags&(128|2048)) and
                   math.isfinite(values[0]) and 0. <= values[0] < 1.)
             self.estimator = (now,ok,flags)
+            self.vel_ratio = values[0]
             self._stream_seen(230,now,unpack_i64(padded(payload,42)))
         elif mid == 111:
             p = padded(payload,16)
@@ -321,7 +352,7 @@ class FlightLink:
             self.offset_us,self.sync_count = None,0
             self._sync_samples = []
             self.attitudes,self.velocities = [],[]
-            self._clear_commands()
+            self._clear_commands('TIME_UNSYNCED')
             self._event('SYNC_TIMEOUT',now,sync_age_us=now-self.sync_us)
 
     def _accept_sync(self,remote,sent,now):
@@ -371,7 +402,7 @@ class FlightLink:
             if abs(estimate-self.offset_us)>C.SYNC_RESET_US:
                 self.generation += 1
                 self.attitudes,self.velocities = [],[]
-                self._clear_commands()
+                self._clear_commands('CLOCK_RESET')
                 event = 'ACCEPT_RESET'
             self.offset_us = estimate
             self.sync_count = required
@@ -389,7 +420,7 @@ class FlightLink:
             return None,info
         stamp = local_us+self.offset_us
         history = self.attitudes
-        exact = next((row for row in history if row[0]==stamp),None)
+        exact = _first_or_none(row for row in history if row[0]==stamp)
         if exact is not None:
             info.update(attitude_status='EXACT',attitude_before_dt_ms=0.,attitude_after_dt_ms=0.)
             return exact[1],info
@@ -427,7 +458,7 @@ class FlightLink:
             return None,None
         stamp = local_us+self.offset_us
         history = self.velocities
-        exact = next((row for row in history if row[0]==stamp),None)
+        exact = _first_or_none(row for row in history if row[0]==stamp)
         if exact is not None:
             return exact[1],0.
         if stamp<history[0][0]:
@@ -471,8 +502,7 @@ class FlightLink:
                          for left,right,a,b in zip(knots,knots[1:],velocities,velocities[1:]))
                      for i in range(3))
 
-    def state(self,now=None):
-        now = self.clock.now_us() if now is None else now
+    def _health_reason(self,now):
         reason = 'OK'
         if not self.connected(now): reason = 'HEARTBEAT_STALE'
         elif not self.synced(now): reason = 'TIME_UNSYNCED'
@@ -484,6 +514,11 @@ class FlightLink:
             v_age = now+self.offset_us-self.velocities[-1][0]
             if not -30000<=q_age<=C.TELEMETRY_TIMEOUT_MS*1000: reason = 'ATTITUDE_SAMPLE_STALE'
             elif not -30000<=v_age<=C.TELEMETRY_TIMEOUT_MS*1000: reason = 'VELOCITY_SAMPLE_STALE'
+        return reason
+
+    def state(self,now=None):
+        now = self.clock.now_us() if now is None else now
+        reason = self._health_reason(now)
         q = self.attitudes[-1][1] if self.attitudes else None
         yaw = 0.
         if q is not None:
@@ -500,7 +535,8 @@ class FlightLink:
     def comm_snapshot(self,now=None):
         now = self.clock.now_us() if now is None else now
         def age(value): return now-value if value is not None and value>-100000000 else None
-        return {'local_us':now,'reason':self.state(now)['reason'],'generation':self.generation,
+        sysid,compid,autopilot = self.last_rx_heartbeat
+        return {'local_us':now,'reason':self._health_reason(now),'generation':self.generation,
                 'offset_us':self.offset_us,'rtt_us':self._last_rtt,'innovation_us':self._last_innovation,
                 'sync_age_us':age(self.sync_us),'queue_wait_us':self._last_queue_wait,
                 'poll_gap_us':self._max_poll_gap,'poll_wall_gap_us':self._max_poll_wall_gap,
@@ -510,7 +546,28 @@ class FlightLink:
                 'bad_crc':self.parser.bad_crc,'rx_out_of_order':self.rx_out_of_order,
                 'reply_mismatch':self.reply_mismatch,'sync_timeouts':self.sync_timeouts,
                 'tx_dropped':self.dropped,'events_dropped':self.events_dropped,
-                'tx_capture_us':self._tx_capture_us,'tx_us':self._tx_us,'tx_age_us':self._tx_age_us}
+                'tx_capture_us':self._tx_capture_us,'tx_us':self._tx_us,'tx_age_us':self._tx_age_us,
+                'rx_bytes':self.rx_bytes,'tx_bytes':self.tx_bytes,
+                'rx_age_us':now-self.last_rx_us if self.rx_bytes and now>=self.last_rx_us else None,
+                'rx_frames':self.rx_frames,'rx_heartbeats':self.rx_heartbeats,
+                'rx_last_hb_sysid':sysid,'rx_last_hb_compid':compid,'rx_last_hb_autopilot':autopilot,
+                'rx_signed_rejected':self.parser.signed_rejected,'rx_unknown_frames':self.parser.skipped,
+                'armed':self.armed,'main_mode':self.main_mode,'sub_mode':self.sub_mode,
+                'estimator_flags':self.estimator[2] if self.estimator else None,
+                'vel_ratio':self.vel_ratio,
+                'estimator_age_us':now-self.estimator[0] if self.estimator else None,
+                'setpoint_tx_count':self.setpoint_tx_count,
+                'setpoint_max_gap_us':self.setpoint_max_gap_us}
+
+    def _check_setpoint_gap(self, now):
+        # Only measure an intended continuous stream; manual stops separate it.
+        if not self._setpoint_expected or self._setpoint_gap_start is None:
+            return
+        gap = now-self._setpoint_gap_start
+        self.setpoint_max_gap_us = max(self.setpoint_max_gap_us,gap)
+        if gap >= C.DIAGNOSTIC_DELAY_MS*1000 and not self._setpoint_delay_reported:
+            self._setpoint_delay_reported = True
+            self._event('SETPOINT_DELAY',now,delay_us=gap)
 
     def _packet(self,mid,payload):
         result = pack_message(mid,payload,self.sequence,C.SOURCE_SYSTEM,C.SOURCE_COMPONENT)
@@ -552,14 +609,23 @@ class FlightLink:
         params = tuple(params)+(0.,)*(7-len(params))
         return self._queue(76,struct.pack('<7fHBBB',*(params+(command,self.target[0],self.target[1],0))))
 
-    def request_mode(self,main_mode,sub_mode=0):
-        return self.send_command(176,(1.,float(main_mode),float(sub_mode)))
+    def request_mode(self,main_mode,sub_mode=0,reason='REQUEST'):
+        queued = self.send_command(176,(1.,float(main_mode),float(sub_mode)))
+        sequence = self.queue[-1][0][4] if queued else -1
+        self._event('MODE_REQUEST',reason='main=%d sub=%d queued=%d seq=%d trigger=%s' %
+                    (main_mode,sub_mode,queued,sequence,reason))
+        return queued
 
     def cancel_offboard_requests(self):
         self.queue = [x for x in self.queue if x[4]!='OFFBOARD']
         if self.active is not None and self.active[4]=='OFFBOARD' and self.active[1]==0: self.active = None
 
-    def cancel_setpoint(self):
+    def cancel_setpoint(self,reason='CANCELLED'):
+        if self._setpoint_expected:
+            self._event('CONTROL_RELEASE',reason=reason)
+        self._setpoint_expected = False
+        self._setpoint_gap_start = None
+        self._setpoint_delay_reported = False
         self.latest_setpoint = None
         if self.active is not None and self.active[3] and self.active[1]==0: self.active = None
         self.cancel_offboard_requests()
@@ -573,10 +639,12 @@ class FlightLink:
         now = self.clock.now_us() if now is None else now
         state = self.state(now)
         if not C.NAV_ENABLE or C.readiness_errors() or not state['ready'] or not state['armed']:
-            self.cancel_setpoint()
+            reason = ('DISABLED' if not C.NAV_ENABLE else 'CONFIG_UNCONFIRMED' if C.readiness_errors()
+                      else state['reason'] if not state['ready'] else 'DISARMED')
+            self.cancel_setpoint(reason)
             return False
         if len(velocity)!=3 or not finite(tuple(velocity)+(yaw,)):
-            self.cancel_setpoint()
+            self.cancel_setpoint('INVALID_REFERENCE')
             return False
         mask = 1|2|4|64|128|256|2048
         stamp = int(now+self.offset_us)//1000
@@ -584,13 +652,18 @@ class FlightLink:
                               0.,0.,0.,yaw,0.,mask,self.target[0],self.target[1],1)
         self.latest_setpoint = [self._packet(84,payload),0,now,True,None,
                                 ('SETPOINT',self._control_capture_us,self.generation,now,self._control_measurement_us)]
+        if not self._setpoint_expected:
+            self._setpoint_gap_start = now
+            self._setpoint_delay_reported = False
+        self._setpoint_expected = True
         self._tx_status = 'QUEUED'
         return True
 
     def _flush(self,now):
         if self.active is None:
-            control = next((i for i,x in enumerate(self.queue) if x[4] is not None),None)
-            sync = next((i for i,x in enumerate(self.queue) if len(x)>5 and x[5] in ('SYNC_REPLY','SYNC_REQUEST')),None)
+            control = _first_or_none(i for i,x in enumerate(self.queue) if x[4] is not None)
+            sync = _first_or_none(i for i,x in enumerate(self.queue)
+                                  if len(x)>5 and x[5] in ('SYNC_REPLY','SYNC_REQUEST'))
             if control is not None: self.active = self.queue.pop(control)
             elif self.latest_setpoint is not None: self.active,self.latest_setpoint = self.latest_setpoint,None
             elif sync is not None: self.active = self.queue.pop(sync)
@@ -635,6 +708,7 @@ class FlightLink:
         # No event formatting or logging between the sampling above and write.
         sent = self.uart.write(packet[position:])
         if sent is None or sent<=0: return
+        self.tx_bytes += sent
         if position==0:
             if tag=='SYNC_REQUEST':
                 self.pending_sync = (token,now)
@@ -654,6 +728,15 @@ class FlightLink:
                 self._tx_capture_us = tag[1] if isinstance(tag,tuple) else None
                 self._tx_control_us = tag[3] if isinstance(tag,tuple) and len(tag)>3 else None
                 self._tx_age_us = None if self._tx_capture_us is None else self._tx_us-self._tx_capture_us
+                self.setpoint_tx_count += 1
+                self._check_setpoint_gap(self._tx_us)
+                if self._setpoint_expected:
+                    self._setpoint_gap_start = self._tx_us
+                    self._setpoint_delay_reported = False
+            elif control in ('MODE','OFFBOARD'):
+                payload = padded(packet[10:10+packet[1]],33)
+                main_mode,sub_mode = struct.unpack('<2f',payload[4:12])
+                self._event('MODE_TX',reason='main=%g sub=%g seq=%d' % (main_mode,sub_mode,packet[4]))
 
     def _service_streams(self,now):
         if not C.REQUEST_STREAMS or not self.connected(now): return
@@ -690,6 +773,8 @@ class FlightLink:
             else:
                 self._max_poll_gap = max(self._max_poll_gap,gap)
                 self._max_poll_wall_gap = max(self._max_poll_wall_gap,wall_gap)
+                if gap >= C.DIAGNOSTIC_DELAY_MS*1000:
+                    self._event('SERVICE_DELAY',now,reason=self.service_stage,delay_us=gap)
         self._last_poll_us,self._last_poll_wall_us = now,wall
         self._clock_generation = epoch
         budget = C.RX_BYTES_PER_POLL
@@ -697,12 +782,15 @@ class FlightLink:
             data = self.uart.read(min(self.uart.any(),budget,512))
             if not data: break
             budget -= len(data)
+            self.rx_bytes += len(data)
             self.last_rx_us = self.clock.now_us()
-            for packet in self.parser.feed(data):
+            packets = self.parser.feed(data)
+            self.rx_frames += len(packets)
+            for packet in packets:
                 self._receive(packet[0],packet[1],packet[2],packet[3],self.clock.now_us())
         now = self.clock.now_us()
         if self.parser.buffer and now-self.last_rx_us>1000000: self.parser.buffer = bytearray()
-        if not self.connected(now): self.cancel_setpoint()
+        if not self.connected(now): self.cancel_setpoint('HEARTBEAT_STALE')
         if self.pending_sync is not None and now-self.pending_sync[1]>C.SYNC_MAX_RTT_MS*1000:
             token,sent = self.pending_sync
             self.pending_sync = None
@@ -719,6 +807,11 @@ class FlightLink:
             if self.connected(now) and self.pending_sync is None and not queued and now-self.sync_sent>=interval*1000:
                 if self._queue(111,pack_i64(0)+pack_i64(now*1000)): self.sync_sent = now
             self._service_streams(now)
+        reason = self._health_reason(now)
+        if reason != self._last_health_reason:
+            self._last_health_reason = reason
+            self._event('HEALTH',now,**self.comm_snapshot(now))
+        self._check_setpoint_gap(now)
         self._flush(self.clock.now_us())
         if service_sync and self.pending_sync is not None and self.connected(self.clock.now_us()):
             token,sent = self.pending_sync

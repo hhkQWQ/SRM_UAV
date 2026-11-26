@@ -2,6 +2,7 @@
 import math
 import os
 import json
+import time
 import config as C
 from pose_solver import (PlanarPoseSolver, finite, rotation_valid, local_to_camera,
                          relative_measurement, quaternion_rotation,
@@ -118,9 +119,8 @@ class PoseCSVLogger:
             if len(row) != len(POSE_LOG_FIELDS):
                 raise ValueError("CSV_FIELD_COUNT")
             self._write(",".join(_csv_cell(v) for v in row) + "\n")
-            if now_us-self.last_flush_us >= POSE_LOG_FLUSH_MS*1000:
-                self.file.flush()
-                self.last_flush_us = now_us
+            if not self.flush_due(now_us):
+                return False
             self.last_sample_us = now_us
             self.last_state = state
             return True
@@ -137,6 +137,16 @@ class PoseCSVLogger:
                 pass
             self.file = None
         print("LOG_ERROR=%s; recording stopped" % self.last_error)
+
+    def flush_due(self, now_us):
+        """Flush even when no camera frame arrives; caller keeps I/O low priority."""
+        if self.file is not None and not 0 <= now_us-self.last_flush_us < POSE_LOG_FLUSH_MS*1000:
+            try:
+                self.file.flush()
+                self.last_flush_us = now_us
+            except Exception as error:
+                self.fail(error)
+        return self.file is not None
 
     def close(self):
         if self.file is not None:
@@ -187,10 +197,20 @@ def run_metadata():
     controls = ('TARGET_HEIGHT_M','ARRIVAL_XY_M','ARRIVAL_Z_M','ARRIVAL_DWELL_MS',
                 'KP_XY','KP_Z','MAX_SPEED_XY','MAX_SPEED_Z','MAX_ACCEL_XY','MAX_ACCEL_Z',
                 'CONTROL_INTERVAL_MS','LOST_BRAKE_MS')
-    metadata = {'schema_version':2,'implementation':'shared_pnp_communication_v2',
+    errors = C.readiness_errors()
+    if not rotation_valid(C.R_BC):
+        errors.append('CAMERA_ROTATION_INVALID')
+    if C.T_BC_M is None or len(C.T_BC_M) != 3 or not finite(C.T_BC_M):
+        errors.append('CAMERA_TRANSLATION_INVALID')
+    metadata = {'schema_version':3,'implementation':'shared_pnp_cooperative_v3',
             'clock':'local unfolded microseconds; remote=local+offset_us',
             'log_interval_ms':POSE_LOG_INTERVAL_MS,
             'control_config':{key:getattr(C,key) for key in controls},
+            'configured':configured(),'config_errors':errors,
+            'scheduling':{'control_interval_ms':C.CONTROL_INTERVAL_MS,
+                          'communication_service_ms':C.COMM_SERVICE_INTERVAL_MS,
+                          'diagnostic_delay_ms':C.DIAGNOSTIC_DELAY_MS,
+                          'policy':'Actual-time deadlines; latest complete image; no catch-up burst'},
             'timing_limits':{key:getattr(C,key) for key in (
                 'SYNC_INTERVAL_MS','SYNC_RECOVERY_INTERVAL_MS','SYNC_MAX_RTT_MS',
                 'SYNC_MAX_JITTER_US','SYNC_MIN_SAMPLES','SYNC_TIMEOUT_MS',
@@ -245,17 +265,19 @@ def vision_enabled(flight):
 
 
 def process_image(img, stamp, solver, tracker, detector, clock, link,
-                  previous=None, previous_color=None, vision_active=True):
+                  previous=None, previous_color=None, vision_active=True, service=None):
     """共享识别、PnP、坐标变换和跟踪；图像与计时接口由平台提供。"""
     pair,color = None,None
     if vision_active:
-        red,blue = detector.detect_lights(img)
+        red,blue = detector.detect_lights(img,service=service)
         debug = img if C.DEBUG_MODE >= 2 else None
-        rp = detector.find_best_pair(red,debug) if C.TARGET_COLOR != "BLUE" else None
-        bp = detector.find_best_pair(blue,debug) if C.TARGET_COLOR != "RED" else None
+        rp = detector.find_best_pair(red,debug,service=service) if C.TARGET_COLOR != "BLUE" else None
+        bp = detector.find_best_pair(blue,debug,service=service) if C.TARGET_COLOR != "RED" else None
         pair,color = detector.select_best_pair(rp,bp)
     if link:
         link.poll()
+    if service:
+        service('detect')
     if link:
         q,velocity,alignment,link_generation = link.observation_at(stamp)
     else:
@@ -274,13 +296,15 @@ def process_image(img, stamp, solver, tracker, detector, clock, link,
             hint = previous if previous_color == color else None
             points = detector.get_pair_points(pair)
             normal = camera_down_normal(q,C.R_BC) if C.HORIZONTAL_TARGET and q is not None else None
-            pose = solver.solve(points,hint,normal_camera=normal)
+            pose = solver.solve(points,hint,normal_camera=normal,service=service)
             spent = clock.now_us()-before
             if pose["valid"]:
                 detection["center"] = pose["center"]
                 previous,previous_color = pose,color
                 if configured() and q is not None:
                     relative = relative_measurement(pose,q,C.R_BC,C.T_BC_M)
+    if service:
+        service('pnp')
     track = tracker.update(detection,stamp//1000,relative,velocity)
     track['_alignment'],track['_link_generation'] = alignment,link_generation
     if not vision_active:
@@ -318,14 +342,64 @@ def update_control(track, flight, stamp, now, servo, link):
         link.set_control_source(stamp if has_position else None,
                                 measurement*1000 if has_position and measurement is not None else None)
         if output is None or output.get("velocity") is None:
-            link.cancel_setpoint()
+            link.cancel_setpoint(servo.state)
             if (servo.state in ("LOST_RELEASE","LOOP_STALE") and servo.state != previous_nav
                     and flight.get("ready") and flight.get("armed")
                     and flight.get("offboard") and flight.get("local_position_ready")):
-                link.request_mode(3,0)
+                link.request_mode(3,0,reason=servo.state)
         else:
             submitted = link.send_velocity(output["velocity"],output["yaw"],now)
     return control_track,output,submitted
+
+
+def service_runtime(runtime, clock, servo, link, stage='idle', force=False):
+    """Small cooperative scheduler, not a handover state machine.
+
+    ``revision`` invalidates in-flight image work after a gate/clock change.
+    Only complete images are published in runtime['result']; this function never
+    changes tracker history, image stamps or real measurement times.
+    """
+    now = clock.now_us()
+    if link:
+        link.service_stage = stage
+    last_service = runtime.get('service_time_us')
+    if (not force and last_service is not None and
+            0 <= now-last_service < C.COMM_SERVICE_INTERVAL_MS*1000):
+        return
+    if link:
+        link.poll()
+    now = clock.now_us()
+    runtime['service_time_us'] = now
+    flight = link.state(now) if link else {'ready':False,'reason':'LINK_DISABLED'}
+    active,generation = vision_enabled(flight),flight.get('generation')
+    if active != runtime.get('vision_active') or generation != runtime.get('generation'):
+        runtime['result'] = None
+        runtime['revision'] = runtime.get('revision',0)+1
+    runtime['vision_active'],runtime['generation'],runtime['flight'] = active,generation,flight
+    gate = (generation,flight.get('reason'),flight.get('armed'),flight.get('offboard'),
+            flight.get('main_mode'),flight.get('sub_mode'))
+    last_control = runtime.get('control_time_us')
+    if (last_control is None or not 0 <= now-last_control < C.CONTROL_INTERVAL_MS*1000
+            or gate != runtime.get('gate')):
+        if link and last_control is not None and now-last_control >= C.DIAGNOSTIC_DELAY_MS*1000:
+            link._event('CONTROL_DELAY',now,reason=stage,delay_us=now-last_control)
+        result = runtime.get('result')
+        track = result['track'] if result is not None else {
+            'position':None,'state':'LOST' if active else 'IDLE','generation':0,
+            '_link_generation':generation}
+        stamp = result['stamp_us'] if result is not None else now
+        control,output,submitted = update_control(track,flight,stamp,now,servo,link)
+        runtime.update(control_track=control,output=output,submitted=submitted,
+                       control_time_us=now,gate=gate)
+        if link:
+            link.poll()
+
+
+def record_log_delay(link, clock, started, label):
+    if link:
+        elapsed = clock.now_us()-started
+        if elapsed >= C.DIAGNOSTIC_DELAY_MS*1000:
+            link._event('LOG_DELAY',reason=label,delay_us=elapsed)
 
 
 def run():
@@ -343,39 +417,72 @@ def run():
     solver = build_solver()
     tracker,servo = TargetTracker(),VisualServo()
     link = FlightLink(clock=clock) if C.LINK_ENABLE else None
-    nav_state = "DISABLED"
-    last_report,last_control = clock.now_us(),-10000000
+    last_report = clock.now_us()
     logger = PoseCSVLogger(start_us=last_report)
     comm_logger = (CommCSVLogger(link,logger.path[:-4]+'_sync.csv',clock=clock)
                    if link and logger.path else None)
     comm_error = None
     frames,solves,solve_sum,solve_peak,frame_id = 0,0,0,0,0
     previous,previous_color = None,None
-    generation = link.generation if link else 0
-    was_vision_active = False
-    control_track,output,setpoint_submitted,control_time = None,None,False,None
+    runtime = {'revision':0}
+    tracker_revision = -1
+    frame_available = getattr(sensor,'get_frame_available',None)
+    last_maintenance = None
+
+    def service(stage='idle', force=False):
+        service_runtime(runtime,clock,servo,link,stage,force)
+
+    def maintenance():
+        nonlocal last_maintenance,comm_error
+        now = clock.now_us()
+        if last_maintenance is not None and 0 <= now-last_maintenance < C.CONTROL_INTERVAL_MS*1000:
+            return
+        service('before_log',True)
+        started = clock.now_us()
+        logger.flush_due(started)
+        if comm_logger:
+            comm_logger.record()
+            if comm_logger.error and comm_logger.error != comm_error:
+                comm_error = comm_logger.error
+                print('COMM_LOG_ERROR=%s' % comm_error)
+        record_log_delay(link,clock,started,'MAINTENANCE')
+        service('log',True)
+        last_maintenance = clock.now_us()
+
     try:
         while True:
             start = clock.now_us()
-            if link:
-                link.poll(service_sync=True)
-                if generation != link.generation:
-                    tracker = TargetTracker()
-                    previous,previous_color = None,None
-                    generation = link.generation
-            capture_start = clock.now_us()
-            before_flight = link.state(capture_start) if link else {}
-            vision_active = vision_enabled(before_flight)
-            if vision_active != was_vision_active:
+            service('wait_frame')
+            if frame_available is not None and not frame_available():
+                maintenance()
+                if hasattr(time,'sleep_ms'): time.sleep_ms(1)
+                else: time.sleep(.001)
+                continue
+            service('wait_frame',True)
+            if tracker_revision != runtime['revision']:
                 tracker = TargetTracker()
                 previous,previous_color = None,None
-                was_vision_active = vision_active
+                tracker_revision = runtime['revision']
+            frame_revision = runtime['revision']
+            vision_active = runtime['vision_active']
+            capture_start = clock.now_us()
             img = sensor.snapshot()
             capture_end = clock.now_us()
             stamp = (capture_start+capture_end)//2-C.CAMERA_CAPTURE_DELAY_US
+            service('capture',True)
+            if frame_revision != runtime['revision']:
+                maintenance()
+                continue
             result,previous,previous_color = process_image(
                 img,stamp,solver,tracker,detector,clock,link,
-                previous,previous_color,vision_active)
+                previous,previous_color,vision_active,service)
+            if (frame_revision == runtime['revision'] and
+                    result['link_generation'] == runtime['generation']):
+                runtime['result'] = result
+            service('image',True)
+            if runtime.get('result') is not result:
+                maintenance()
+                continue
             q,velocity = result["q"],result["velocity"]
             detection,pose,relative,points = (result[key] for key in ("detection","pose","relative","points"))
             track,color,spent = result["track"],result["color"],result["solve_us"]
@@ -383,19 +490,6 @@ def run():
                 solves += 1
                 solve_sum += spent
                 solve_peak = max(solve_peak,spent)
-            if link:
-                link.poll()
-            now = clock.now_us()
-            flight = link.state(now) if link else {"ready":False,"reason":"LINK_DISABLED"}
-            if now-last_control >= C.CONTROL_INTERVAL_MS*1000:
-                control_track,output,setpoint_submitted = update_control(
-                    track,flight,stamp,now,servo,link)
-                nav_state = servo.state
-                last_control = now
-                control_time = now
-            if link:
-                link.poll()
-                flight = link.state(clock.now_us())
             if C.DEBUG_MODE:
                 center = None
                 cross_color = (255,160,0)  # 中心关联或预测，不代表新鲜三维测量
@@ -408,26 +502,31 @@ def run():
                     center = detection["center"]
                 if center is not None and 0 <= center[0] < img.width() and 0 <= center[1] < img.height():
                     img.draw_cross(int(round(center[0])),int(round(center[1])),size=8,color=cross_color,thickness=2)
+            service('display',True)
             pre_log_end = clock.now_us()
+            flight = runtime['flight']
+            nav_state = servo.state
             frame_id += 1
             log_state = log_state_key(track['state'],nav_state,flight,track.get('_alignment',{}))
             if logger.due(pre_log_end,log_state):
+                service('before_pose_log',True)
+                flight,nav_state = runtime['flight'],servo.state
+                log_state = log_state_key(track['state'],nav_state,flight,track.get('_alignment',{}))
+                log_started = clock.now_us()
                 try:
                     seconds = max(1e-6, (pre_log_end-last_report)*1e-6)
                     row = pose_log_row(
                         frame_id, stamp, pre_log_end, capture_end-capture_start,
                         pre_log_end-start, (frames+1)/seconds, spent, q, pose,
                         relative, track, velocity, flight, nav_state, points, color,
-                        vision_active, control_time, control_track,
-                        output, setpoint_submitted)
+                        vision_active, runtime.get('control_time_us'),runtime.get('control_track'),
+                        runtime.get('output'),runtime.get('submitted',False))
                     logger.write(row, pre_log_end,log_state)
                 except Exception as error:
                     logger.fail(error)
-            if comm_logger:
-                comm_logger.record()
-                if comm_logger.error and comm_logger.error != comm_error:
-                    comm_error = comm_logger.error
-                    print('COMM_LOG_ERROR=%s' % comm_error)
+                record_log_delay(link,clock,log_started,'POSE')
+                service('pose_log',True)
+            maintenance()
             end = clock.now_us()
             frames += 1
             if end-last_report >= C.DEBUG_PRINT_INTERVAL_MS*1000:
@@ -443,7 +542,7 @@ def run():
     finally:
         try:
             if link:
-                link.cancel_setpoint()
+                link.cancel_setpoint('PROGRAM_EXIT')
         finally:
             if comm_logger:
                 comm_logger.close()
