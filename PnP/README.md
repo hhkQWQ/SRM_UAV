@@ -15,22 +15,16 @@
 
 程序不自动解锁、起飞或请求进入 Offboard。Offboard 通道在 QGC 中自行映射，OpenMV 读取 PX4 心跳中的实际模式，不需要配置原始 RC 通道号。没有增加自动启动脚本；板卡原有 `main.py` 启动机制未修改。
 
-当前串口为 UART3 / 115200 / 8N1。H7 Plus 的 P4(TX) 接飞控 RX，P5(RX) 接飞控 TX，并共地。以 TELEM2 配给 MAVLink 实例1为例：`MAV_1_CONFIG=TELEM 2`、`MAV_1_MODE=Onboard`、`SER_TEL2_BAUD=115200`；仅接 TX/RX/GND 时设置 `MAV_1_FLOW_CTRL=0`。根据实际端口、实例和设备手册调整，需要重启的参数在修改后重启飞控生效。
-
-核实相机、焦点、标定及实物尺寸。当前输入320×240，两灯条中心线间距135mm、端点间距55mm；镜头朝下、机头在画面下方，光心位于机体参考点前方14cm、下方4cm。正确到位时，目标相机位置约为 `(0,-0.14,0.96)m`，不必位于光轴中心。`TARGET_HEIGHT_M=1.0` 是机体参考点到靶面的重力方向间距，不是相机深度或距地高度。
+核实相机、焦点、标定及实物尺寸。当前输入320×240，两灯条中心线间距135mm、端点间距55mm；镜头朝下、机头在画面下方，光心位于机体参考点前方0cm、下方2cm。正确到位时，目标相机位置约为 `(0,0,0.98)m`，不必位于光轴中心。`TARGET_HEIGHT_M=1.0` 是机体参考点到靶面的重力方向间距，不是相机深度或距地高度。
 
 ## 统一状态与导航条件
 
 `TargetTracker` 输出以下目标状态：
-
-| `track` | 含义 | 是否允许目标导航 |
-| --- | --- | --- |
-| `ACQUIRING` | 中心尚在确认，或已有二维中心但可信三维数据不足；原 `CENTER_ONLY` 已并入此状态 | 否 |
-| `MEASURED` | 新的真实三维观测已经过跟踪器确认和一致性检查 | 满足Offboard及健康条件时允许 |
-| `PREDICTED` | 利用已建立的三维观测和飞控速度进行有限时间预测 | 满足Offboard及健康条件时允许 |
-| `LOST` | 目标不可用，或预测超过帧数/时间边界 | 否 |
-
-板端未启动识别时，日志中 `track=IDLE`，表示待命，而非进行识别后丢失目标。
+`IDLE`：待机状态，视觉处理未启动；不允许导航
+`ACQUIRING`:中心尚在确认，或已有二维中心但可信三维数据不足；原 `CENTER_ONLY` 已并入此状态;不允许导航
+`MEASURED`：新的真实三维观测已经过跟踪器确认和一致性检查，Offboard+条件健康时允许导航
+`PREDICTED`：利用已建立的三维观测和飞控速度进行有限时间预测，Offboard+条件健康时允许
+`LOST`：目标不可用，或预测超过帧数/时间边界；不允许导航
 
 三维状态初建或失效后，仍需跟踪器内原有的3次一致观测。预测最多保留4帧，并限制在250ms内，需要有效飞控速度；不会把预测时间当作新的真实观测。控制器接收 `MEASURED/PREDICTED` 后直接计算参考，不再重复统计确认帧或等待额外稳定窗口。
 
@@ -41,44 +35,39 @@
 `VisualServo.update()` 在一次更新中执行：
 `配置/解锁/遥测检查 → 实际模式检查 → 目标状态与位置时效检查 → 计算有界速度或制动`。
 
-`nav` 直接记录该控制器状态：`PRIMING`、`WAIT_OFFBOARD`、`ACQUIRING`、`CENTERING`、`ALIGN`、`PREDICT`、`HOLD`、`BRAKING`、`LOST_RELEASE` 等，不再记录单独接管阶段，也不重复保存同义的 `servo` 列。
+`nav` 直接记录该控制器状态：`PRIMING`、`WAIT_OFFBOARD`、`ACQUIRING`、`CENTERING`、`ALIGN`、`PREDICT`、`HOLD`、`BRAKING`、`LOST_RELEASE` ，具体定义如下：
 
 ### 控制状态 nav
 
 这些状态由现有VisualServo根据当前数据选择，不要求按表从上到下逐级通过。表中的“速度参考”只描述本机输出，是否执行以PX4实际模式为准。
+`DISABLED`：NAV_ENABLE=False；相机继续观察和识别，控制器停止提供导航参考。
+`CONFIG_UNCONFIRMED`：模型、标定、外参或控制配置未通过检查。控制器停止提供参考，具体原因可结合日志配套 JSON 的 configured 和 config_errors 查看。
+`DISARMED`：遥测检查通过，但飞控未解锁。健康检查优先，所以未解锁且遥测也异常时，会先显示遥测失败原因。
+`PRIMING`：飞控健康、已解锁且实际处于 Position。程序用零速度和当前航向提供预热参考，视觉跟踪处于 IDLE。
+`WAIT_OFFBOARD`：飞控健康、已解锁，但当前既不在 Position，也不在 Offboard。程序等待模式变化，暂不提供速度参考。
+`ACQUIRING`：处于Offboard模式，有候选，正在确认。可能还在确认二维中心，也可能已经跟住中心、正在累计三维观测。期望速度设为零，按加速度限制收速||期望速度为零，按加速度限制制动；有效数据恢复后可导航||
+`BRAKING`：处于Offboard模式，当前拿不到可用目标位置。可能是还没看到目标、位置已过期，或缺少速度数据而无法做位移补偿。期望速度同样设为零||同上，缺测持续超过800ms则释放||
+`TARGET_CHANGED`：已有控制目标后，跟踪目标代数发生变化；本次期望速度置零、清除到位与下降许可，随后使用新目标
+`CENTERING`：当前比目标高度高出5cm以上，且下降条件还未满足。先做水平纠偏，竖直速度参考向零收敛。
+`ALIGN`：使用有效实测位置计算限幅后的三轴速度。向下运动仍需满足水平对准和图像边缘条件。刚进入到位范围、尚未持续满 700 ms 时，也可以是这个状态。
+`PREDICT`：暂时缺少新测量，短时预测位置仍可用。控制器继续有限的水平纠偏，竖直速度参考向零收敛，并清除到位计时。
+`HOLD`：水平距离误差和高度误差分别在 5 cm 内，且实测输入持续满足条件至少 700 ms。比例外环继续纠偏，超出容差或转入预测就退出 HOLD。
+`LOST_RELEASE`：在 Offboard 中连续 超过 800 ms 没有可用目标位置，停止提供速度参考。ACQUIRING和BRAKING共用这段计时。如果有效数据恢复且飞控仍在 Offboard，控制器可以重新计算参考。
+`LOOP_STALE`：两次控制更新时间差为负或超过 250 ms，本次停止提供参考，并清除内部速度指令和相关计时。
+与flight相同的失败原因：遥测健康检查失败，`nav` 会直接显示原因，例如 TIME_UNSYNCED 或 VELOCITY_STALE。此时停止提供参考，恢复后按实际飞控模式重新判断。
 
-| 状态 | 触发情况 | 本机行为及恢复条件 |
-| --- | --- | --- |
-| `DISABLED` | NAV_ENABLE=False | 不发送导航参考；保持观察 |
-| `CONFIG_UNCONFIRMED` | 标定、模型、外参或控制配置检查不通过 | 停止参考；核对配置JSON中的configured/config_errors及相机参数 |
-| `DISARMED` | 链路健康但未解锁 | 停止参考；健康检查在解锁检查之前，故可能先显示flight失败原因 |
-| `PRIMING` | 健康、已解锁、实际主模式为3（Position） | 零速度并跟随当前航向预热；不运行目标检测；不是“PX4已允许切换”的确认 |
-| `WAIT_OFFBOARD` | 健康、已解锁，处于其他非Offboard模式 | 不发送参考；当前程序只在Position中预热 |
-| `ACQUIRING` | 实际Offboard，目标或三维位置尚在确认 | 期望速度为零，按加速度限制制动；有效数据恢复后可导航 |
-| `BRAKING` | 实际Offboard，目标位置缺失、过期或不可补偿 | 同上，缺测持续超过800ms则释放 |
-| `TARGET_CHANGED` | 已有控制目标后，跟踪目标代数发生变化 | 本次期望速度置零、清除到位与下降许可，随后使用新目标；不是额外稳定等待阶段 |
-| `CENTERING` | 仍高于目标高度且没有下降许可 | 水平纠偏，竖直参考向零制动 |
-| `ALIGN` | 有效实测目标，尚未满足持续到位条件 | 计算有界三轴速度；下降仍检查水平走廊和图像边缘 |
-| `PREDICT` | 跟踪器输出有效PREDICTED | 有限水平导航，竖直参考向零制动，不建立到位确认 |
-| `HOLD` | 实测输入的水平/高度误差均≤5cm，持续≥700ms | 仍运行比例外环；超出容差或转为预测后取消到位确认 |
-| `LOST_RELEASE` | 数据不足持续>800ms | 停止参考；满足条件时请求一次Position；有效数据恢复且实际仍Offboard时可按原规则继续 |
-| `LOOP_STALE` | 控制更新间隔<0或>250ms | 本次停止参考、清除运动参考；满足条件时请求一次Position |
-| 与flight相同的失败原因 | 遥测或同步不健康 | 停止参考，健康恢复后重新按实际模式处理 |
 
 ### 飞控健康原因 flight
-
 `flight=OK`只表示本程序的通信/估计门控通过，不代表PX4已经允许Offboard，也不包含解锁、模式、配置或目标确认条件。若多个条件失败，reason按下表顺序显示首项；HEALTH事件和周期摘要保留原始判据供电脑端核对。
 
-| 原因 | 当前判据 | 查看哪些数据 |
-| --- | --- | --- |
-| `HEARTBEAT_STALE` | 未识别目标飞控或有效心跳年龄不在0～1500ms | heartbeat_age_us、rx_bytes、rx_heartbeats、rx_last_hb_*、签名/CRC计数 |
-| `TIME_UNSYNCED` | 未获得至少3个一致样本，或同步映射超过5秒未更新 | offset_us、sync_age_us、rtt_us及同步异常事件 |
-| `ATTITUDE_STALE` | 姿态接收年龄不在0～200ms | attitude_age_us、SERVICE_DELAY及流请求事件 |
-| `VELOCITY_STALE` | 速度接收年龄不在0～200ms | velocity_age_us、SERVICE_DELAY及流请求事件 |
-| `ESTIMATOR_UNREADY` | 无估计器消息、消息年龄不在0～1000ms、flags不合格或vel_ratio不合格 | estimator_age_us、estimator_flags、vel_ratio |
-| `ATTITUDE_SAMPLE_STALE` | 已通过以上检查，但姿态源时间相对当前时间不在−30～200ms | attitude_age_us与同步状态 |
-| `VELOCITY_SAMPLE_STALE` | 同上，速度源时间不在−30～200ms | velocity_age_us与同步状态 |
-| `LINK_DISABLED` | LINK_ENABLE=False | 配置；没有飞控链路可用 |
+`HEARTBEAT_STALE` | 目标 PX4 的心跳没能刷新。 可能还没识别到目标飞控，也可能最近一次有效心跳的接收年龄超出 0～1500 ms。| 需要关注heartbeat_age_us、rx_bytes、rx_heartbeats、rx_last_hb_*、签名/CRC计数 |
+`TIME_UNSYNCED` | 两端时钟还没对齐，或已有的同步已失效。 初次建立时钟映射需要至少 3 个一致样本。距上次接受的同步更新超过 5 秒，映射失效 | 需要关注offset_us、sync_age_us、rtt_us及同步异常事件 |
+`ATTITUDE_STALE` | OpenMV 没有及时接纳有效姿态。没有有效四元数历史，或最近一条的接收年龄超出 0～200 ms。 | 需要关注attitude_age_us、SERVICE_DELAY及流请求事件 |
+`VELOCITY_STALE` | OpenMV 没有及时接纳有效速度。 没有有效速度历史，或最近一条的接收年龄超出 0～200 ms。 | 需要关注velocity_age_us、SERVICE_DELAY及流请求事件 |
+`ESTIMATOR_UNREADY` | 飞控估计器没通过本程序的检查。 可能缺少 ESTIMATOR_STATUS、接收年龄超出 0～1000 ms，也可能是 estimator_flags 或 vel_ratio 不合格。 | 需要关注estimator_age_us、estimator_flags、vel_ratio |
+`ATTITUDE_SAMPLE_STALE` | 姿态刚收到也可能报这个。按 PX4 消息自带的时间戳计算，最新姿态离当前时刻太远，超出 −30～200 ms。| 需要关注attitude_age_us与同步状态 |
+`VELOCITY_SAMPLE_STALE` | 同样检查 PX4 消息自带的时间戳，对象是最新速度，允许范围也是 −30～200 ms。 | 需要关注velocity_age_us与同步状态 |
+`LINK_DISABLED` | LINK_ENABLE=False | 需要关注LINK_ENABLE数值 |
 
 estimator_flags按MAVLink位值解释：1=姿态、2=水平速度、4=垂直速度、8=相对水平位置、16=绝对水平位置、32=垂直位置、128=恒定位置模式、2048=加速度异常。当前健康门控要求1/2/4均置位、128/2048均清零，并要求有限的`0≤vel_ratio<1`。Position退出请求还要求8和32置位。原始flags不是PX4的vehicle_local_position.xy_valid；当前发送的是速度参考，复盘还需结合PX4的速度有效性与模式拒绝记录。[MAVLink估计器标志](https://mavlink.io/en/messages/common.html#ESTIMATOR_STATUS_FLAGS)
 
@@ -97,21 +86,20 @@ estimator_flags按MAVLink位值解释：1=姿态、2=水平速度、4=垂直速�
 
 ## 纯室内定位与飞控配置
 
-不需要GPS或标靶全球坐标，但PX4仍需可用的姿态、速度和本地定位。用户提供的来源可能是MTF-02光流，接线、测距和EKF融合尚未实测；应先确认无GPS环境下Position可正常工作。PnP相对观测目前没有作为 `ODOMETRY` 等测量送入EKF，光流测距也不替代到靶板的PnP距离。[PX4光流](https://docs.px4.io/v1.17/en/sensor/optical_flow)
+光流和测距帮 PX4 判断飞机自己怎么动，PnP 帮 OpenMV 判断靶板相对飞机在哪。 室内可以不用 GPS，也不用给靶板设经纬度，但 PX4 仍需要知道飞机的姿态、速度和本地位置。我们使用MTF-02光流一体化模块对无人机进行定位；应先确认无GPS环境下Position可正常工作。[PX4光流](https://docs.px4.io/v1.17/en/sensor/optical_flow)
 
-在QGC的Flight Modes中自行选择模式通道与Offboard档位，保留可切回Position的操作。配置并验证 `COM_OF_LOSS_T`、`COM_OBL_RC_ACT`；Position请求能否成功取决于当时定位，不能承诺状态估计失效后仍能定点保持。程序不写飞控参数。
+当前代码先用相机外参把 PnP 结果从相机坐标系转换到机体系，再用拍照时刻的 PX4 姿态把向量转到本地 NED 轴向。这个向量仍然表示从飞机指向靶板的位置，由 VisualServo 用来计算速度和航向设定值。PnP相对观测目前没有作为 `ODOMETRY` 等测量送入EKF，光流测距也不替代到靶板的PnP距离。
+
+在 QGC 里配好能手动切换 Position 和 Offboard 的档位。`COM_OF_LOSS_T` 决定 PX4 收不到外部设定值多久后触发处置，`COM_OBL_RC_ACT` 决定触发后怎么处理。这些参数由你在 QGC 里设置。飞机能不能切回 Position 并定点保持，取决于当时的定位还是否有效。
 
 ## 时间同步与延迟补偿
 
-板端与仿真使用同一份 `FlightLink`：TIMESYNC在首字节即将write时填写时间戳，零字节发送失败后重试会重新取时，部分写入开始后保持原报文不变。只有实际开始发送才建立待回复事务；接收每份消息时重新取时，发送队列等待不再进入时钟偏移公式。同步报文也有排队期限，过期后丢弃并重试。
-
-启动和恢复阶段每200ms采样，稳定后每1秒采样；至少3个近期一致样本后建立同步。低RTT样本与中位数抑制偶发延迟，连续3个一致变化允许重新收敛；单个大离群点不清空历史。确认的大幅时钟变化、PX4重启或本地时钟回退会使旧观测失效。保留30ms RTT上限、5秒同步有效期、200ms遥测时效与30ms姿态外推上限；具体数值统一由 `config.py` 管理。
-
-图像按采集时间查询姿态插值/受限外推和速度插值。控制前重新取时，以PX4速度历史的梯形积分补偿采集至控制的位移；无法覆盖该区间时不继续使用旧目标位置。补偿只作用于控制副本，不写回采集时刻的跟踪状态。短时姿态缺失使用原跟踪器的有限预测，不因单帧缺失额外清空轨迹；同步或整体遥测失效仍执行原健康门控。
-
-板端使用小步非阻塞轮询，不再在采图前整段等待同步回复。检测、候选配对/去重和PnP迭代边界穿插同一个服务函数；等待新图像时也继续收发和控制。仿真保留其ROS/UDP调度及独立通信线程，仅复用PnP算法和链路接口，不模拟OpenMV的硬件执行耗时。服务间隔由日志中的 `poll_gap_us/poll_wall_gap_us` 观察。
-
-这些时间是软件write和消息处理时刻，不是硬件线路时间戳。真实曝光时刻仍由snapshot前后中点近似，`CAMERA_CAPTURE_DELAY_US`需要实机测量；同步估计不能消除全部单向传输延迟。
+时间同步解决的是「这张图对应哪一刻的飞控数据」。延迟补偿解决的是「从拍照到控制更新，飞机又移动了多少」。
+1. 用 FlightLink 对齐 OpenMV 和 PX4 的时钟。 TIMESYNC 在串口首次写入前填入发送时间，接收端按每条报文的处理时刻取时间，因此软件发送队列里的等待不会算进往返时间。一次写入若返回 0 字节，下次会重新取时。若已经写出部分报文，剩余字节沿用原报文继续发送。
+2. 用多次测量估计时钟偏移。 启动和恢复时约每 200 ms 尝试一次，稳定后约每 1 秒一次。程序优先使用往返时间较短的样本，至少有 3 个一致样本才建立同步。往返时间上限是 30 ms，已建立的同步超过 5 秒未更新就会失效。单次偏差过大时先拒绝该次更新，确认时钟大幅变化、PX4 重启或本地时钟回退后，旧观测会失效。
+3. 按图像采集时间匹配遥测，再补偿到控制时刻。 process_image() 用图像时间查询姿态和速度，有前后样本时做插值。姿态在最新样本之后最多外推 30 ms，遥测时效门限是 200 ms。到了 update_control()，程序对采集到控制之间的速度做梯形积分，用图像时刻的目标相对位置减去这段时间内飞机的位移。`track` 对应采集时刻，`control_track` 是控制器实际采用的副本。速度历史无法覆盖补偿区间时，该副本按 LOST 处理。偶尔一帧缺姿态时，跟踪器仍可在原有条件内做短时预测。
+4. 在图像处理间隙继续处理通信。 OpenMV 等待新帧、做检测和执行 PnP 时，会在可让出的计算边界调用 service_runtime()。仿真复用同一套 PnP 和 FlightLink，收发由独立线程调度。OpenMV 实际最长停顿多久，看板端日志的 poll_gap_us 和 poll_wall_gap_us。
+图像时间目前取 snapshot() 起止时刻的中点减去 CAMERA_CAPTURE_DELAY_US。这个中点是曝光时刻的近似，修正值需实测。串口对时同样使用软件时间戳，仍可能受到收发两侧延迟不对称的影响。
 
 ## 板端自适应调度
 
@@ -127,70 +115,60 @@ estimator_flags按MAVLink位值解释：1=姿态、2=水平速度、4=垂直速�
 
 运行时自动编号创建 `/pnp_pose_NNNN.csv`、同名 `.json` 配置和 `/pnp_pose_NNNN_sync.csv` 通信记录，启动会打印实际路径。控制日志默认约每200ms记录一次，并补记状态变化；通信日志正常每1秒摘要，只对异常和状态转换单独记事件。每秒刷新缓冲，正常退出关闭文件；写入错误只停止相应日志并提示。历史文件不覆盖，不保存图像或视频。
 
-控制CSV由原70列精简为34列，删除完整四元数、重复欧拉角、旋转矩阵、像素角点、滤波位置副本、帧率和求解耗时等常驻列。保留定位有效性、原始相对位置、实际控制输入和必要时序；精确列名以 `main.POSE_LOG_FIELDS` 为准。
+控制CSV为34列，保留定位有效性、原始相对位置、实际控制输入和必要时序；精确列名以 `main.POSE_LOG_FIELDS` 为准。
 
-| 字段 | 含义 |
-| --- | --- |
-| `frame_id/capture_time_us` | 当前图像编号与采集时间 |
-| `control_time_us/control_capture_time_us` | 最近控制更新的时间及其实际使用的源图像时间；不可默认与当前图像相同 |
-| `link_generation` | 本次观测所属链路代数，重置前后的观测不能混用 |
-| `track/control_track/nav/flight` | 图像跟踪状态、控制实际采用状态、VisualServo行为和飞控健康原因 |
-| `armed/offboard/vision_enabled` | 解锁、实际Offboard和识别启用情况 |
-| `pose_valid/pose_reason/relative_valid/relative_reason/reprojection_px` | 区分视觉求解失败、姿态不可用和坐标变换拒绝 |
-| `attitude_status/attitude_before_dt_ms/attitude_after_dt_ms` | 姿态匹配结果及前后样本相对采集时刻的时间差 |
-| `velocity_age_ms/observation_age_ms` | 采集时速度匹配年龄与最近真实目标观测的年龄 |
-| `p_local_raw_x_m/y_m/z_m` | 当前图像采集时的原始NED相对测量 |
-| `control_p_local_x_m/y_m/z_m` | 经预测、延迟与有效性检查后实际用于控制的NED位置 |
-| `command_vn_mps/ve_mps/vd_mps/setpoint_submitted` | 速度参考和本机缓冲提交结果 |
-| `tx_status/tx_image_age_ms` | 发送状态及已write参考的源图像年龄；write不等于PX4采用或执行ACK |
+`frame_id/capture_time_us` ：当前图像编号与采集时间
+`control_time_us/control_capture_time_us`：最近控制更新的时间及其实际使用的源图像时间；不可默认与当前图像相同
+`link_generation`：本次观测所属链路代数，重置前后的观测不能混用
+`track/control_track/nav/flight`：图像跟踪状态、控制实际采用状态、VisualServo行为和飞控健康原因
+`armed/offboard/vision_enabled`：解锁、实际Offboard和识别启用情况
+`pose_valid/pose_reason/relative_valid/relative_reason/reprojection_px`：区分视觉求解失败、姿态不可用和坐标变换拒绝
+`attitude_status/attitude_before_dt_ms/attitude_after_dt_ms`：姿态匹配结果及前后样本相对采集时刻的时间差
+`velocity_age_ms/observation_age_ms`：采集时速度匹配年龄与最近真实目标观测的年龄
+`p_local_raw_x_m/y_m/z_m`：当前图像采集时的原始NED相对测量
+`control_p_local_x_m/y_m/z_m`：经预测、延迟与有效性检查后实际用于控制的NED位置
+`command_vn_mps/ve_mps/vd_mps/setpoint_submitted`：速度参考和本机缓冲提交结果
+`tx_status/tx_image_age_ms`：发送状态及已write参考的源图像年龄；write不等于PX4采用或执行ACK
 
 tx_status描述本机最近的发送处理，可被后续提交覆盖，不是每个包的执行确认：
 
-| tx_status | 含义 |
-| --- | --- |
-| NONE | 尚无速度参考提交 |
-| QUEUED | 最新参考已提交，尚未完成完整write；也可能正在部分写入 |
-| WRITTEN | 最近一份参考已完整write；单看此值不能证明参考流仍连续 |
-| CANCELLED | 待发参考被取消，或链路重置清理；部分已写入的数据帧允许写完，避免破坏串口帧 |
-| EXPIRED | 尚未开始写入时超过100ms排队期限 |
-| REJECTED | 尚未开始写入时，健康、解锁或真实观测年龄复查失败 |
+NONE 尚无速度参考提交
+QUEUED 最新参考已提交，尚未完成完整write；也可能正在部分写入
+WRITTEN 最近一份参考已完整write；单看此值不能证明参考流仍连续
+CANCELLED 待发参考被取消，或链路重置清理；部分已写入的数据帧允许写完，避免破坏串口帧
+EXPIRED 尚未开始写入时超过100ms排队期限
+REJECTED 尚未开始写入时，健康、解锁或真实观测年龄复查失败
 
 通信CSV字段定义在 `comm_log.COMM_LOG_FIELDS`。正常摘要保留偏移、最近RTT/创新量、同步年龄、排队等待、心跳和遥测年龄、累计最大服务间隔、发送时刻与源图像年龄，以及CRC、倒序、回复不匹配、同步失效、发送丢弃和诊断丢事件计数。异常行只填写该事件相关字段。
 
 ### 基础预热诊断与200ms异常
 
-通信CSV在原字段后追加9列，原34列控制CSV不变；配置JSON以schema_version=3记录调度参数和configured/config_errors。
+通信CSV在原字段后追加9列；配置JSON以schema_version=3记录调度参数和configured/config_errors。
 
-| 新字段 | 含义 |
-| --- | --- |
-| armed/main_mode/sub_mode | 心跳确认的解锁及PX4实际模式；主模式3=Position、6=Offboard |
-| estimator_flags/vel_ratio/estimator_age_us | 原始估计状态、速度创新量和接收年龄；空值表示不可用/非有限，不能当作0 |
-| setpoint_tx_count | 从本次程序启动累计完整写入的速度参考数；零写入和部分写入尚未完成时不计 |
-| setpoint_max_gap_us | 本次启动以来、应连续发送期间的最大等待/写入间隔，含首份参考等待；主动停发或链路重置分段，不跨段统计 |
-| delay_us | 延迟事件的实测间隔；正常摘要留空 |
+armed/main_mode/sub_mode：心跳确认的解锁及PX4实际模式；主模式3=Position、6=Offboard
+estimator_flags/vel_ratio/estimator_age_us：原始估计状态、速度创新量和接收年龄；空值表示不可用/非有限，不能当作0
+setpoint_tx_count：从本次程序启动累计完整写入的速度参考数；零写入和部分写入尚未完成时不计
+setpoint_max_gap_us：本次启动以来、应连续发送期间的最大等待/写入间隔，含首份参考等待；主动停发或链路重置分段，不跨段统计
+delay_us：延迟事件的实测间隔；正常摘要留空
 
 正常仍约1秒摘要，健康原因变化时补记HEALTH原始快照；不在线解释每个flags或评定“预热合格”。相邻摘要的setpoint_tx_count差除以时间差可估算区间平均频率，不能证明区间内没有短断流；结合最大间隔、事件和PX4接收状态核对。PRIMING是正在提供零参考，setpoint_submitted是进入本机缓冲，WRITTEN是本地完整write，均不等于PX4已采用。
 
 新增性能事件仅在DIAGNOSTIC_DELAY_MS=200ms及以上记录：
 
-| 事件 | 对应情况 |
-| --- | --- |
-| SERVICE_DELAY | 相邻通信poll间隔≥200ms；reason是服务所在阶段（capture/detect/pair/dedup/pnp/log等），只能提示停顿附近位置 |
-| CONTROL_DELAY | 相邻控制更新间隔≥200ms |
-| SETPOINT_DELAY | 应连续发送期间≥200ms未完整写入速度参考；每个停顿只报一次，完成写入后重新计时 |
-| LOG_DELAY | 控制日志写入或维护刷新耗时≥200ms；reason为POSE或MAINTENANCE |
+SERVICE_DELAY：相邻通信poll间隔≥200ms；reason是服务所在阶段（capture/detect/pair/dedup/pnp/log等），只能提示停顿附近位置
+CONTROL_DELAY：相邻控制更新间隔≥200ms
+SETPOINT_DELAY：应连续发送期间≥200ms未完整写入速度参考；每个停顿只报一次，完成写入后重新计时
+LOG_DELAY：控制日志写入或维护刷新耗时≥200ms；reason为POSE或MAINTENANCE
 
 该门限只决定新增性能事件，不改变30ms同步RTT、200ms遥测、250ms预测/控制或800ms丢靶规则。现有同步/发送错误事件与CRC等计数继续保留；正常几十毫秒波动不新增延迟事件。同一停顿可能同时造成服务、控制和发送异常，应按时间一起阅读。
 
 ### 退出控制的证据
 
-| 事件 | 含义 |
-| --- | --- |
-| CONTROL_RELEASE | 本机停止一个已经开始提供的参考流；reason为控制状态、链路原因或PROGRAM_EXIT，仅停止时记录一次 |
-| MODE_REQUEST | 一次模式请求及入队结果；reason含main/sub、queued、发送seq和触发原因 |
-| MODE_TX | 该模式命令完整写入本地串口；main/sub及seq用于与入队事件核对 |
-| MODE_ACK | 收到目标飞控的模式命令ACK；记录原始result/progress，不在线匹配为某次请求成功 |
-| FLIGHT_MODE | 首份有效心跳或实际模式/解锁变化；新值在armed/main_mode/sub_mode，reason保存旧值 |
+CONTROL_RELEASE：本机停止一个已经开始提供的参考流；reason为控制状态、链路原因或PROGRAM_EXIT，仅停止时记录一次
+MODE_REQUEST：一次模式请求及入队结果；reason含main/sub、queued、发送seq和触发原因
+MODE_TX：该模式命令完整写入本地串口；main/sub及seq用于与入队事件核对
+MODE_ACK：收到目标飞控的模式命令ACK；记录原始result/progress，不在线匹配为某次请求成功
+FLIGHT_MODE：首份有效心跳或实际模式/解锁变化；新值在armed/main_mode/sub_mode，reason保存旧值
 
 ACK的result常见值：0=接受、1=暂拒、2=拒绝、3=不支持、4=失败、5=进行中、6=取消。ACK不回显请求seq，接受也不等于已经切换；实际模式以FLIGHT_MODE及后续摘要为准。queued=0表示未入队；入队后也可能TX_EXPIRED。缺少ACK可能是没有回复或日志丢失，不能自动认定退出成功。
 
@@ -221,3 +199,11 @@ bash /home/hhkqwq/SRM_UAV/sim/start_simulation.sh
 - 补齐预热原始诊断、参考写入统计及200ms以上延迟事件。
 - 分别记录停止参考、模式请求、命令写入、ACK和实际模式变化。
 - 补全目标、控制、健康和发送状态说明，统一PnP与仿真的算法及日志接口。
+
+## Openmv对接飞控串口设置
+飞控上为GPS1口 飞控QGC设置为MAV_2 
+GPS_1_CONFIG ：disabled
+MAV_2_CONFIG ：GPS1(201)
+MAV_2_MODE : Normal(0)或者Onboard(2)
+MAV_2_FLOW_CTRL : Force off(0)
+SER_GPS1_BAUD : 115200
